@@ -10,12 +10,16 @@ var svcCount int64 = 0
 
 type chanSvc chan func()
 
-func svcSync[T any](s chanSvc, code func() T) T {
-	result := make(chan T)
+func svcSync[T any](s chanSvc, code func() (T, error)) (T, error) {
+	result := make(chan bool)
+	var value T
+	var err error
 	svc(s, func() {
-		result <- code()
+		value, err = code()
+		result <- true
 	})
-	return <-result
+	<-result
+	return value, err
 }
 
 func svc(s chanSvc, code func()) {

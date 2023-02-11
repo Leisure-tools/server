@@ -172,9 +172,9 @@ func (sv *testServer) post(url ...any) *MockResponseWriter {
 	return resp
 }
 
-func createServer(t *testing.T, name string) (*WebService, *testServer) {
+func createServer(t *testing.T, name string) (*LeisureService, *testServer) {
 	mux := http.NewServeMux()
-	ws := initialize(name, mux, MemoryStorage)
+	ws := Initialize(name, mux, MemoryStorage)
 	sv := &testServer{
 		t:   t,
 		mux: mux,
@@ -190,12 +190,12 @@ func TestCreate(t *testing.T) {
 	resp = sv.get(SESSION_CREATE, "s1", "fred")
 	resp = sv.get(SESSION_LIST)
 	//fmt.Println("response:", resp.buf)
-	s := ws.sessions["s1"]
-	l := s.History.Latest[s.Peer]
+	session := ws.sessions["s1"]
+	l := session.History.Latest[session.Peer]
 	if l == nil {
-		l = s.History.Source
+		l = session.History.Source
 	}
-	testEqual(t, l.GetDocument(s.History).String(), "bob content", "Documents are not the same")
+	testEqual(t, l.GetDocument(session.History).String(), "bob content", "Documents are not the same")
 	ws.shutdown()
 }
 
@@ -268,8 +268,11 @@ func TestEdits(t *testing.T) {
 	d1 := doc.NewDocument(doc1)
 	d1.Replace("emacs", index(d1.String(), 0, 5), 3, "ONE")
 	d1.Replace("emacs", index(d1.String(), 2, 10), 0, "\nline four")
-	sv.post(SESSION_REPLACE, "emacs", "?", "key", key, jsonEncode(t, replacements(d1.Edits())))
-	resp := sv.post(SESSION_COMMIT, "emacs", "?", "key", key, jsonEncode(t, jmap("selectionOffset", 0, "selectionLength", 0)))
+	resp := sv.post(SESSION_REPLACE, "emacs", "?", "key", key, jsonEncode(t, jmap(
+		"replacements", replacements(d1.Edits()),
+		"selectionOffset", 0,
+		"selectionLength", 0,
+	)))
 	fmt.Printf("result: %s\n", resp.buf)
 	testEqual(t, sv.get(SESSION_GET, "emacs", "?", "key", key).jsonDecode(t).v, doc1Edited, "")
 	ws.shutdown()
