@@ -15,10 +15,37 @@ import (
 
 	doc "github.com/leisure-tools/document"
 	hist "github.com/leisure-tools/history"
+	diff "github.com/sergi/go-diff/diffmatchpatch"
 )
 
-var ErrBadFormat = errors.New("Bad format, expecting an object with a command property but got")
-var ErrCommandFormat = errors.New("Bad command format, expecting")
+type LeisureError struct {
+	Type string
+	Data map[string]any
+}
+
+func NewLeisureError(errorType string, values ...any) LeisureError {
+	e := LeisureError{Type: errorType}
+	if len(values) > 1 {
+		e.Data = map[string]any{}
+	}
+	for i := 0; i+1 < len(values); i += 2 {
+		if str, ok := values[i].(string); ok {
+			e.Data[str] = values[i+1]
+		}
+	}
+	return e
+}
+
+var ErrUnknown = NewLeisureError("unknownError")
+var ErrDocumentExists = NewLeisureError("documentExists")
+var ErrDocumentAliasExists = NewLeisureError("documentAliasExists")
+var ErrCommandFormat = NewLeisureError("badCommandFormat")
+var ErrUnknownDocument = NewLeisureError("unknownDocument")
+var ErrUnknownSession = NewLeisureError("unknownSession")
+var ErrDuplicateSession = NewLeisureError("duplicateSession")
+var ErrDuplicateConnection = NewLeisureError("duplicateConnection")
+var ErrExpiredSession = NewLeisureError("expiredSession")
+var ErrInternalError = NewLeisureError("internalError")
 
 const (
 	DEFAULT_COOKIE_TIMEOUT = 5 * time.Minute
@@ -35,6 +62,12 @@ type LeisureService struct {
 	storageFactory  func(docId, content string) hist.DocStorage
 	updates         map[*LeisureSession]chan bool
 	cookieTimeout   time.Duration
+}
+
+type LeisureContext struct {
+	*LeisureService
+	w http.ResponseWriter
+	r *http.Request
 }
 
 type LeisureSession struct {
@@ -62,22 +95,32 @@ const (
 	SESSION_UPDATE  = VERSION + "/session/update"
 )
 
-func isGood(w http.ResponseWriter, err any, msg any, status int) bool {
-	if err != nil {
-		w.Write([]byte(fmt.Sprint(msg)))
-		w.WriteHeader(status)
-		return false
-	}
-	return true
+func (err LeisureError) Error() string {
+	return err.Type
 }
 
-func readJson(w http.ResponseWriter, r *http.Request) (jsonObj, bool) {
-	if bytes, err := io.ReadAll(r.Body); isGood(w, err, "bad request format", http.StatusNotAcceptable) {
-		if obj, err := jsonFor(bytes); isGood(w, err, "bad request format", http.StatusNotAcceptable) {
-			return jsonV(obj), true
+func ErrorType(errObj any) string {
+	if err, ok := errObj.(error); ok {
+		for err != nil {
+			if e, ok := err.(LeisureError); ok {
+				return e.Type
+			}
+			err = errors.Unwrap(err)
 		}
 	}
-	return jsonV(nil), false
+	return ErrUnknown.Type
+}
+
+func ErrorData(errObj any) map[string]any {
+	if err, ok := errObj.(error); ok {
+		for err != nil {
+			if e, ok := err.(LeisureError); ok {
+				return e.Data
+			}
+			err = errors.Unwrap(err)
+		}
+	}
+	return nil
 }
 
 func jsonFor(data []byte) (any, error) {
@@ -120,9 +163,26 @@ func NewWebService(id string, storageFactory func(string, string) hist.DocStorag
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, msg any) {
-	w.WriteHeader(status)
-	w.Write([]byte(fmt.Sprint(msg)))
+func (sv *LeisureContext) writeError(lerr LeisureError, format string, args ...any) {
+	sv.writeRawError(sv.error(lerr, format, args...))
+}
+
+func ErrorJSON(err any) string {
+	return string(ErrorJSONBytes(err))
+}
+
+func ErrorJSONBytes(err any) []byte {
+	m := jmap("error", ErrorType(err), "message", fmt.Sprint(err))
+	for key, value := range ErrorData(err) {
+		m[key] = value
+	}
+	bytes, _ := json.Marshal(m)
+	return bytes
+}
+
+func (sv *LeisureContext) writeRawError(err error) {
+	sv.w.WriteHeader(http.StatusBadRequest)
+	sv.w.Write(ErrorJSONBytes(err))
 }
 
 func writeSuccess(w http.ResponseWriter, msg any) {
@@ -140,30 +200,32 @@ func writeSuccess(w http.ResponseWriter, msg any) {
 // URL: /doc/create/ID
 // URL: /doc/create/ID?alias=ALIAS -- optional alias for document
 // creates a new document id from content in body
-func (sv *LeisureService) docCreate(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) docCreate() {
 	sv.svcSync(func() {
-		id := path.Base(r.URL.Path)
-		alias := r.URL.Query().Get("alias")
+		id := path.Base(sv.r.URL.Path)
+		alias := sv.r.URL.Query().Get("alias")
 		if sv.documents[id] != nil {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("There is already a document with id %s", id))
-		} else if content, err := io.ReadAll(r.Body); err != nil {
-			writeError(w, http.StatusBadRequest, "Error reading document content")
+			sv.writeError(ErrDocumentExists, "There is already a document with id %s", id)
+		} else if content, err := io.ReadAll(sv.r.Body); err != nil {
+			sv.writeError(ErrCommandFormat, "Error reading document content")
 		} else if alias != "" && sv.documentAliases[alias] != "" {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("Document alias %s already exists", alias))
+			sv.writeError(ErrDocumentAliasExists, "Document alias %s already exists", alias)
 		} else {
 			str := string(content)
 			sv.documents[id] = hist.NewHistory(sv.storageFactory(id, str), str)
 			if alias != "" {
 				sv.documentAliases[alias] = id
 			}
-			writeSuccess(w, "")
+			writeSuccess(sv.w, "")
 		}
 	})
 }
 
-func writeResponse(w http.ResponseWriter, obj any) {
-	if data, err := json.Marshal(obj); isGood(w, err, "internal error", http.StatusInternalServerError) {
-		writeSuccess(w, data)
+func (sv *LeisureContext) writeResponse(obj any) {
+	if data, err := json.Marshal(obj); err != nil {
+		sv.writeRawError(err)
+	} else {
+		writeSuccess(sv.w, data)
 	}
 }
 
@@ -173,7 +235,7 @@ func writeResponse(w http.ResponseWriter, obj any) {
 
 // URL: /doc/list
 // list the documents and their aliases
-func (sv *LeisureService) docList(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) docList() {
 	sv.svcSync(func() {
 		docs := [][]string{}
 		revAlias := map[string]string{}
@@ -183,19 +245,19 @@ func (sv *LeisureService) docList(w http.ResponseWriter, r *http.Request) {
 		for docId := range sv.documents {
 			docs = append(docs, []string{docId, revAlias[docId]})
 		}
-		writeResponse(w, docs)
+		sv.writeResponse(docs)
 	})
 }
 
 // URL: /doc/latest/DOC_ID
 // Retrieve the latest document contents
-func (sv *LeisureService) docGet(w http.ResponseWriter, r *http.Request) {
-	sv.jsonResponseSvc(w, r, func() (any, error) {
-		docId, _ := sv.getDocId(r)
+func (sv *LeisureContext) docGet() {
+	sv.jsonResponseSvc(sv.w, sv.r, func() (any, error) {
+		docId, _ := sv.getDocId(sv.r)
 		if docId == "" {
-			return nil, sv.error(r, "Expected document ID in url: %s", r.URL)
+			return nil, sv.error(ErrCommandFormat, "Expected document ID in url: %s", sv.r.URL)
 		} else if doc := sv.documents[docId]; doc == nil {
-			return nil, sv.error(r, "No document for id: %s", docId)
+			return nil, sv.error(ErrUnknownDocument, "No document for id: %s", docId)
 		} else {
 			return doc.GetLatestDocument().String(), nil
 		}
@@ -212,25 +274,56 @@ func (sv *LeisureService) getDocId(r *http.Request) (string, string) {
 	return docId, path.Dir(p)
 }
 
+// add replacements on the session for changes between the current doc and newDoc
+func addChanges(session *LeisureSession, newDoc string) bool {
+	// check document and add edits to session
+	doc := session.latestBlock().GetDocument(session.History)
+	doc.Apply(session.Peer, session.PendingOps)
+	dmp := diff.New()
+	pos := 0
+	changed := false
+	for _, dif := range dmp.DiffMain(doc.String(), newDoc, true) {
+		switch dif.Type {
+		case diff.DiffDelete:
+			session.Replace(pos, len(dif.Text), "")
+			changed = true
+		case diff.DiffEqual:
+			pos += len(dif.Text)
+		case diff.DiffInsert:
+			session.Replace(pos, 0, dif.Text)
+			changed = true
+		}
+	}
+	return changed
+}
+
 // URL: /session/create/SESSION/DOC
 // creates a new session with peer name = sv.id + sv.serial and connects to it.
-func (sv *LeisureService) sessionCreate(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) sessionCreate() {
 	sv.svcSync(func() {
-		docId, p := sv.getDocId(r)
+		docId, p := sv.getDocId(sv.r)
 		sessionId := path.Base(p)
 		//fmt.Println("docId:", docId, "sessionId:", sessionId)
 		if docId == "" {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("No document ID. Session create requires a session ID and a document ID"))
+			sv.writeError(ErrCommandFormat, "No document ID. Session create requires a session ID and a document ID")
 		} else if sessionId == "" {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("No session ID. Session create requires a session ID and a document ID"))
+			sv.writeError(ErrCommandFormat, "No session ID. Session create requires a session ID and a document ID")
 		} else if sv.documents[docId] == nil {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("There is no document with id %s", docId))
+			sv.writeError(ErrUnknownDocument, "There is no document with id %s", docId)
 		} else if sv.sessions[sessionId] != nil {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("There is already a session named %s", sessionId))
+			sv.writeError(ErrDuplicateSession, "There is already a session named %s", sessionId)
 		} else {
 			//fmt.Printf("Create session: %s on document %s\n", sessionId, docId)
-			sv.addSession(w, sessionId, docId)
-			writeSuccess(w, "")
+			session := sv.addSession(sv.w, sessionId, docId)
+			if sv.r.Method == http.MethodPost {
+				if incoming, err := io.ReadAll(sv.r.Body); err != nil {
+					sv.writeError(ErrCommandFormat, "Could not read document contents")
+				} else {
+					sv.writeResponse(addChanges(session, string(incoming)))
+					return
+				}
+			}
+			writeSuccess(sv.w, "null")
 		}
 	})
 }
@@ -244,7 +337,7 @@ func (sv *LeisureService) removeStaleSessions(d time.Duration) {
 	}
 }
 
-func (sv *LeisureService) addSession(w http.ResponseWriter, sessionId, docId string) {
+func (sv *LeisureService) addSession(w http.ResponseWriter, sessionId, docId string) *LeisureSession {
 	session := &LeisureSession{
 		hist.NewSession(fmt.Sprint(sv.unixSocket, '-', sessionId), sv.documents[docId]),
 		sessionId,
@@ -256,45 +349,59 @@ func (sv *LeisureService) addSession(w http.ResponseWriter, sessionId, docId str
 	}
 	sv.sessions[sessionId] = session
 	session.connect(w)
+	return session
 }
 
 // URL: /doc/list
 // list the documents and their aliases
-func (sv *LeisureService) sessionList(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) sessionList() {
 	sv.svcSync(func() {
 		sessions := []string{}
 		for name := range sv.sessions {
 			sessions = append(sessions, name)
 			//fmt.Println("session:", name)
 		}
-		writeResponse(w, sessions)
+		sv.writeResponse(sessions)
 	})
 }
 
 // URL: /session/connect/SESSION_ID
-// URL: /session/connect/SESSION_ID?docId=ID -- automatically create session SESSION_NAME
-func (sv *LeisureService) sessionConnect(w http.ResponseWriter, r *http.Request) {
-	sv.jsonResponseSvc(w, r, func() (any, error) {
-		if sessionId, ok := urlTail(r, SESSION_CONNECT); !ok {
-			return nil, sv.error(r, "Bad connect format, should be %sID but was %s", SESSION_CONNECT, r.URL.RequestURI())
+// URL: /session/connect/SESSION_ID?doc=ID -- automatically create session SESSION_NAME
+// If this is a post
+//
+//	the body must contain the client's current version of the doc
+//	the session computes edits based on its version of the doc and applies them to the session.
+//
+// returns whether the body contained changes to the session's document
+func (sv *LeisureContext) sessionConnect() {
+	sv.jsonResponseSvc(sv.w, sv.r, func() (any, error) {
+		if sessionId, ok := urlTail(sv.r, SESSION_CONNECT); !ok {
+			return nil, sv.error(ErrCommandFormat, "Bad connect format, should be %sID but was %s", SESSION_CONNECT, sv.r.URL.RequestURI())
 		} else {
-			docId := r.URL.Query().Get("docId")
+			docId := sv.r.URL.Query().Get("doc")
 			if docId != "" && sv.documents[docId] == nil && sv.documentAliases[docId] != "" {
 				docId = sv.documentAliases[docId]
 			}
 			if session := sv.sessions[sessionId]; session == nil && docId == "" {
-				return nil, sv.error(r, "No session %s", sessionId)
+				return nil, sv.error(ErrUnknownSession, "No session %s", sessionId)
 			} else if session == nil && docId != "" && sv.documents[docId] == nil {
-				return nil, sv.error(r, "No document %s", docId)
-			} else if !session.expired() {
-				return nil, sv.error(r, "There is already a connection for %s", sessionId)
+				return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
+			} else if session != nil && !session.expired() {
+				return nil, sv.error(ErrDuplicateConnection, "There is already a connection for %s", sessionId)
 			} else {
 				if session == nil {
-					sv.addSession(w, sessionId, docId)
+					session = sv.addSession(sv.w, sessionId, docId)
 				} else {
-					session.connect(w)
+					session.connect(sv.w)
 				}
-				return true, nil
+				if sv.r.Method == http.MethodPost {
+					if incoming, err := io.ReadAll(sv.r.Body); err != nil {
+						return nil, sv.error(ErrCommandFormat, "Could not read document contents")
+					} else {
+						return addChanges(session, string(incoming)), nil
+					}
+				}
+				return false, nil
 			}
 		}
 	})
@@ -305,18 +412,18 @@ func urlTail(r *http.Request, parent string) (string, bool) {
 	return tail, parent == head
 }
 
-func (sv *LeisureService) sessionFor(w http.ResponseWriter, r *http.Request) (*LeisureSession, error) {
+func (sv *LeisureContext) sessionFor(w http.ResponseWriter, r *http.Request) (*LeisureSession, error) {
 	cookie, err := r.Cookie("session")
 	if err != nil {
-		return nil, sv.error(r, "No session key")
+		return nil, sv.error(ErrCommandFormat, "No session key")
 	} else if keyValue := strings.Split(cookie.Value, "="); len(keyValue) != 2 {
-		return nil, sv.error(r, "Bad format for session key")
+		return nil, sv.error(ErrCommandFormat, "Bad format for session key")
 	} else if session := sv.sessions[keyValue[0]]; session == nil {
-		return nil, sv.error(r, "No session for key")
+		return nil, sv.error(ErrCommandFormat, "No session for key")
 	} else if session.key.Value != cookie.Value {
-		return nil, sv.error(r, "Bad key for session")
+		return nil, sv.error(ErrCommandFormat, "Bad key for session")
 	} else if session.expired() {
-		return nil, sv.error(r, "Session expired")
+		return nil, sv.error(ErrExpiredSession, "Session expired")
 	} else {
 		session.lastUsed = time.Now()
 		http.SetCookie(w, session.key)
@@ -324,9 +431,10 @@ func (sv *LeisureService) sessionFor(w http.ResponseWriter, r *http.Request) (*L
 	}
 }
 
-func (sv *LeisureService) error(r *http.Request, format string, args ...any) error {
-	err := fmt.Errorf(format, args...)
-	if cookie, e := r.Cookie("session"); e != nil && cookie != nil {
+func (sv *LeisureContext) error(lerr LeisureError, format string, args ...any) error {
+	args = append(append(make([]any, 0, len(args)+1), lerr), args...)
+	err := fmt.Errorf("%w:"+format, args...)
+	if cookie, e := sv.r.Cookie("session"); e != nil && cookie != nil {
 		if keyValue := strings.Split(cookie.Value, "="); len(keyValue) != 2 {
 			if session := sv.sessions[keyValue[0]]; session == nil {
 				if session.key.Value != cookie.Value {
@@ -342,58 +450,61 @@ func (sv *LeisureService) error(r *http.Request, format string, args ...any) err
 
 // URL: /session/edit
 // Replace text from replacements in body, commit them, and return the resulting edits
-func (sv *LeisureService) sessionEdit(w http.ResponseWriter, r *http.Request) {
-	sv.jsonSvc(w, r, func(repls jsonObj) (any, error) {
+func (sv *LeisureContext) sessionEdit() {
+	sv.jsonSvc(sv.w, sv.r, func(repls jsonObj) (result any, err error) {
+		// set err if there's a panic
+		defer func() { err = asError(recover()) }()
 		//fmt.Printf("\nREPLACE: %v\n\n", repls)
-		if session, err := sv.sessionFor(w, r); err != nil {
+		if session, err := sv.sessionFor(sv.w, sv.r); err != nil {
 			return nil, err
 		} else if !repls.isMap() {
-			return nil, sv.error(r, "%w a replacement map but got %v", ErrCommandFormat, repls.v)
-		} else if offset := repls.getJson("selectionOffset"); !offset.isNumber() {
-			println("NO SELECTION OFFSET")
-			return nil, fmt.Errorf("%w a selection offset in the replacement but got: %v", ErrCommandFormat, repls.v)
-		} else if length := repls.getJson("selectionLength"); !length.isNumber() {
-			println("NO SELECTION LENGTH")
-			return nil, fmt.Errorf("%w a selection length in the replacement but got: %v", ErrCommandFormat, repls.v)
+			return nil, sv.error(ErrCommandFormat, "expected a replacement map but got %v", repls.v)
+		} else if offset := repls.getJson("selectionOffset"); !offset.isNumber() || offset.asInt() < 0 {
+			println("BAD SELECTION OFFSET")
+			return nil, sv.error(ErrCommandFormat, "expected a selection offset in the replacement but got: %v", repls.v)
+		} else if length := repls.getJson("selectionLength"); !length.isNumber() || length.asInt() < -1 {
+			println("BAD SELECTION LENGTH")
+			return nil, sv.error(ErrCommandFormat, "expected a selection length in the replacement but got: %v", repls.v)
 		} else if repls := repls.getJson("replacements"); !repls.isArray() {
 			println("BAD REPLACEMENTS")
-			return nil, fmt.Errorf("%w replacement map with a replacement array but got: %v", ErrCommandFormat, repls.v)
+			return nil, sv.error(ErrCommandFormat, "expected replacement map with a replacement array but got: %v", repls.v)
 		} else {
 			repl := make([]hist.Replacement, 0, 4)
 			l := repls.len()
 			for i := 0; i < l; i++ {
-				el := jsonV(repls.get(i))
+				el := repls.getJson(i)
 				//fmt.Println("OBJ:", obj.v, "EL:", el.v)
 				if !el.isMap() {
 					println("NOT MAP")
-					return nil, fmt.Errorf("%w an array of replacements but got %v", ErrCommandFormat, repls.v)
+					return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
 				}
 				offset := el.getJson("offset")
 				length := el.getJson("length")
 				text := el.getJson("text")
 				if !(offset.isNumber() && length.isNumber() && (text.isNil() || text.isString())) {
 					//fmt.Printf("BAD ARGS OFFSET: %v, LENGTH: %v, TEXT: %v", offset.v, length.v, text.v)
-					return nil, fmt.Errorf("%w an array of replacements but got %v", ErrCommandFormat, repls.v)
+					return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
 				} else if text.isNil() {
 					text = jsonV("")
 				}
-				repl = append(repl, doc.Replacement{
+				curRepl := doc.Replacement{
 					Offset: offset.asInt(),
 					Length: length.asInt(),
 					Text:   text.asString(),
-				})
+				}
+				if curRepl.Offset < 0 || (curRepl.Length < 0 && curRepl.Offset != 0) {
+					return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
+				}
+				if curRepl.Length == -1 {
+					// a complete replacement destroys earlier edits
+					repl = repl[:0]
+				}
+				repl = append(repl, curRepl)
 			}
-			//fmt.Printf("\n\nREPLACE INTO DOC: %s\n", session.History.GetLatestDocument())
-			//fmt.Printf("\n\nREPLACE INTO DOC: %s\n", session.History.Latest[session.Peer].GetDocument(session.History).String())
-			blk := session.History.Latest[session.Peer]
-			if blk == nil {
-				blk = session.History.Source
-			}
-			//fmt.Printf("\n\nREPLACE INTO DOC: %s\n", blk.GetDocument(session.History).String())
-			//if bytes.Compare(session.History.LatestHashes()[0][:], session.History.Source.Hash[:]) == 0 {
-			//	fmt.Println("DOC IS SOURCE")
-			//}
-			// done validating arguments
+			// Apply will panic if there's a problem with repl and cause the defer to return an erorr
+			blk := session.latestBlock()
+			blk.GetDocument(session.History).Apply(blk.Peer, repl)
+			// done validating inputs
 			session.ReplaceAll(repl)
 			repl, off, len := session.Commit(offset.asInt(), length.asInt())
 			latest := session.History.LatestHashes()
@@ -417,27 +528,38 @@ func (sv *LeisureService) sessionEdit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func asError(err any) error {
+	if result, ok := err.(error); ok || err == nil {
+		return result
+	}
+	return fmt.Errorf("%s", err)
+}
+
+func (session *LeisureSession) latestBlock() *hist.OpBlock {
+	blk := session.History.Latest[session.Peer]
+	if blk == nil {
+		blk = session.History.Source
+	}
+	return blk
+}
+
 // URL: /session/get -- get the document for the session
-func (sv *LeisureService) httpSessionGet(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) sessionGet() {
 	sv.svcSync(func() {
-		if session, err := sv.sessionFor(w, r); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if session, err := sv.sessionFor(sv.w, sv.r); err != nil {
+			sv.writeRawError(err)
 		} else {
-			blk := session.History.Latest[session.Peer]
-			if blk == nil {
-				blk = session.History.Source
-			}
-			doc := blk.GetDocument(session.History).String()
-			//fmt.Println("GOT DOC:", doc)
-			writeSuccess(w, doc)
+			doc := session.latestBlock().GetDocument(session.History)
+			doc.Apply(session.Peer, session.PendingOps)
+			writeSuccess(sv.w, doc.String())
 		}
 	})
 }
 
-func (sv *LeisureService) httpSessionUpdate(w http.ResponseWriter, r *http.Request) {
+func (sv *LeisureContext) sessionUpdate() {
 	ch := make(chan bool)
 	svc(sv.service, func() {
-		session, err := sv.sessionFor(w, r)
+		session, err := sv.sessionFor(sv.w, sv.r)
 		if err == nil && !session.hasUpdate && session.updates == nil {
 			timer := time.After(2 * time.Minute)
 			newUpdates := make(chan bool)
@@ -449,7 +571,7 @@ func (sv *LeisureService) httpSessionUpdate(w http.ResponseWriter, r *http.Reque
 				case hadUpdate = <-newUpdates:
 				case <-timer:
 				}
-				sv.jsonResponseSvc(w, r, func() (any, error) {
+				sv.jsonResponseSvc(sv.w, sv.r, func() (any, error) {
 					if session.updates == newUpdates {
 						if oldUpdates != nil {
 							go func() { oldUpdates <- hadUpdate }()
@@ -462,7 +584,7 @@ func (sv *LeisureService) httpSessionUpdate(w http.ResponseWriter, r *http.Reque
 				ch <- true
 			}()
 		} else {
-			sv.jsonResponse(w, r, func() (any, error) {
+			sv.jsonResponse(sv.w, sv.r, func() (any, error) {
 				return true, err
 			})
 			ch <- true
@@ -471,21 +593,21 @@ func (sv *LeisureService) httpSessionUpdate(w http.ResponseWriter, r *http.Reque
 	<-ch
 }
 
-func (sv *LeisureService) jsonResponseSvc(w http.ResponseWriter, r *http.Request, fn func() (any, error)) {
+func (sv *LeisureContext) jsonResponseSvc(w http.ResponseWriter, r *http.Request, fn func() (any, error)) {
 	sv.svcSync(func() {
 		sv.jsonResponse(w, r, fn)
 	})
 }
 
-func (sv *LeisureService) jsonSvc(w http.ResponseWriter, r *http.Request, fn func(jsonObj) (any, error)) {
+func (sv *LeisureContext) jsonSvc(w http.ResponseWriter, r *http.Request, fn func(jsonObj) (any, error)) {
 	sv.jsonResponseSvc(w, r, func() (any, error) {
 		if body, err := io.ReadAll(r.Body); err != nil {
-			return nil, fmt.Errorf("%w expected a json body", ErrCommandFormat)
+			return nil, sv.error(ErrCommandFormat, "expected a json body")
 		} else {
 			var msg any
 			if len(body) > 0 {
 				if err := json.Unmarshal(body, &msg); err != nil {
-					return nil, fmt.Errorf("%w expected a json body but got %v", ErrCommandFormat, body)
+					return nil, sv.error(ErrCommandFormat, "expected a json body but got %v", body)
 				}
 			}
 			return fn(jsonV(msg))
@@ -493,11 +615,11 @@ func (sv *LeisureService) jsonSvc(w http.ResponseWriter, r *http.Request, fn fun
 	})
 }
 
-func (sv *LeisureService) jsonResponse(w http.ResponseWriter, r *http.Request, fn func() (any, error)) {
+func (sv *LeisureContext) jsonResponse(w http.ResponseWriter, r *http.Request, fn func() (any, error)) {
 	if obj, err := fn(); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		sv.writeRawError(err)
 	} else {
-		writeResponse(w, obj)
+		sv.writeResponse(obj)
 	}
 }
 
@@ -518,22 +640,23 @@ func MemoryStorage(id, content string) hist.DocStorage {
 	return hist.NewMemoryStorage(content)
 }
 
+func (sv *LeisureService) handle(mux *http.ServeMux, url string, fn func(*LeisureContext)) {
+	mux.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+		fn(&LeisureContext{sv, w, r})
+	})
+}
+
 func Initialize(id string, mux *http.ServeMux, storageFactory func(string, string) hist.DocStorage) *LeisureService {
 	sv := NewWebService(id, storageFactory)
-	mux.HandleFunc(DOC_CREATE, sv.docCreate)
-	mux.HandleFunc(DOC_LIST, sv.docList)
-	mux.HandleFunc(DOC_GET, sv.docGet)
-	mux.HandleFunc(SESSION_CREATE, sv.sessionCreate)
-	mux.HandleFunc(SESSION_LIST, sv.sessionList)
-	mux.HandleFunc(SESSION_CONNECT, sv.sessionConnect)
-	mux.HandleFunc(SESSION_EDIT, sv.sessionEdit)
-	mux.HandleFunc(SESSION_GET, sv.httpSessionGet)
-	mux.HandleFunc(SESSION_UPDATE, sv.httpSessionUpdate)
+	sv.handle(mux, DOC_CREATE, (*LeisureContext).docCreate)
+	sv.handle(mux, DOC_LIST, (*LeisureContext).docList)
+	sv.handle(mux, DOC_GET, (*LeisureContext).docGet)
+	sv.handle(mux, SESSION_CREATE, (*LeisureContext).sessionCreate)
+	sv.handle(mux, SESSION_LIST, (*LeisureContext).sessionList)
+	sv.handle(mux, SESSION_CONNECT, (*LeisureContext).sessionConnect)
+	sv.handle(mux, SESSION_EDIT, (*LeisureContext).sessionEdit)
+	sv.handle(mux, SESSION_GET, (*LeisureContext).sessionGet)
+	sv.handle(mux, SESSION_UPDATE, (*LeisureContext).sessionUpdate)
 	runSvc(sv.service)
 	return sv
 }
-
-//func start(id string, storageFactory func(string, string) hist.DocStorage) {
-//	Initialize(id, http.DefaultServeMux, storageFactory)
-//	log.Fatal(http.ListenAndServe(":8080", nil))
-//}
