@@ -3,11 +3,63 @@ package server
 import (
 	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 )
 
 ///
 /// json
 ///
+
+type stringMap = map[string]string
+
+type fieldMap struct {
+	fields     []string
+	properties []string
+}
+
+var fieldMaps map[string]*fieldMap = map[string]*fieldMap{}
+
+const JSON_TAG = `(^|,)json:"([^"]+)"`
+
+func (m *fieldMap) propertyFor(field string) string {
+	for i, fld := range m.fields {
+		if fld == field {
+			return m.properties[i]
+		}
+	}
+	return ""
+}
+
+func (m *fieldMap) fieldFor(property string) string {
+	for i, prop := range m.properties {
+		if prop == property {
+			return m.fields[i]
+		}
+	}
+	return ""
+}
+
+func getFieldMap(t reflect.Type) *fieldMap {
+	m := fieldMaps[t.Name()]
+	if m == nil {
+		fields := make([]string, 0, t.NumField())
+		properties := make([]string, 0, t.NumField())
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			re, _ := regexp.Compile(JSON_TAG)
+			if match := re.FindSubmatch([]byte(field.Tag)); match != nil {
+				prop := string(match[2])
+				fields = append(fields, field.Name)
+				properties = append(properties, prop)
+			} else {
+			}
+		}
+		m = &fieldMap{fields, properties}
+		fieldMaps[t.Name()] = m
+	}
+	return m
+}
 
 func jmap(items ...any) map[string]any {
 	result := map[string]any{}
@@ -53,7 +105,7 @@ func (j jsonObj) baseValue() reflect.Value {
 }
 
 func baseValue(v reflect.Value) reflect.Value {
-	for v.Kind() == reflect.Pointer {
+	for v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface {
 		v = v.Elem()
 	}
 	return v
@@ -65,7 +117,7 @@ func (j jsonObj) len() int {
 	case reflect.Slice, reflect.Array, reflect.Map:
 		return j.baseValue().Len()
 	case reflect.Struct:
-		return t.NumField()
+		return len(getFieldMap(t).fields)
 	}
 	return 0
 }
@@ -93,24 +145,12 @@ func (j jsonObj) getJson(key any) jsonObj {
 	return jsonV(j.get(key))
 }
 
-func structKeys(t reflect.Type) []string {
-	if t.Kind() == reflect.Pointer {
-		return structKeys(t.Elem())
-	}
-	keys := make([]string, 0, 4)
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		keys = append(keys, f.Name)
-	}
-	return keys
-}
-
 func (j jsonObj) keys() []string {
 	keys := make([]string, 0, 4)
-	v := j.value()
+	v := j.baseValue()
 	switch v.Kind() {
-	case reflect.Struct, reflect.Pointer:
-		return structKeys(v.Type())
+	case reflect.Struct:
+		return getFieldMap(v.Type()).properties
 	case reflect.Map:
 		r := v.MapRange()
 		for r.Next() {
@@ -138,16 +178,18 @@ func (j jsonObj) get(key any) any {
 	v := j.baseValue()
 	switch v.Kind() {
 	case reflect.Struct:
+		fieldMap := getFieldMap(v.Type())
 		if str, ok := key.(string); ok {
-			result := v.FieldByName(str)
-			if !result.IsValid() {
-				return nil
+			if field := fieldMap.fieldFor(str); field != "" {
+				result := v.FieldByName(field)
+				if !result.IsValid() {
+					return nil
+				}
+				return result.Interface()
 			}
-			return result.Interface()
 		}
 	case reflect.Map:
-		switch k := key.(type) {
-		case string:
+		if k, ok := key.(string); ok {
 			return value(v.MapIndex(reflect.ValueOf(k)))
 		}
 	case reflect.Slice, reflect.Array:
@@ -170,6 +212,9 @@ func (j jsonObj) get(key any) any {
 }
 
 func value(v reflect.Value) any {
+	if !v.IsValid() {
+		return nil
+	}
 	switch baseType(v.Type()).Kind() {
 	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Interface:
 		return v.Interface()
@@ -183,6 +228,45 @@ func value(v reflect.Value) any {
 		return v.String()
 	default:
 		return nil
+	}
+}
+
+func (j jsonObj) String() string {
+	switch j.typeof() {
+	case "string":
+		return "\"" + strings.ReplaceAll(j.asString(), "\"", "\\\"") + "\""
+	case "array":
+		sb := &strings.Builder{}
+		sb.WriteString("[")
+		first := true
+		for i := 0; i < j.len(); i++ {
+			if first {
+				first = false
+			} else {
+				sb.WriteString(",")
+			}
+			sb.WriteString(j.getJson(i).String())
+		}
+		sb.WriteString("]")
+		return sb.String()
+	case "object":
+		sb := &strings.Builder{}
+		sb.WriteString("{")
+		first := true
+		for _, key := range j.keys() {
+			if first {
+				first = false
+			} else {
+				sb.WriteString(",")
+			}
+			sb.WriteString(jsonV(key).asString())
+			sb.WriteString(":")
+			sb.WriteString(j.getJson(key).String())
+		}
+		sb.WriteString("}")
+		return sb.String()
+	default:
+		return fmt.Sprint(j.v)
 	}
 }
 

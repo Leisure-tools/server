@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	doc "github.com/leisure-tools/document"
+	"github.com/leisure-tools/history"
 )
 
 type MockResponseWriter struct {
@@ -51,6 +52,10 @@ func newMockResponseWriter() *MockResponseWriter {
 		buf:    bytes.NewBuffer(make([]byte, 0, 1024)),
 		header: http.Header{},
 	}
+}
+
+type myT struct {
+	*testing.T
 }
 
 type errorResult1[V any] struct {
@@ -95,45 +100,6 @@ func (l lazyString) String() string {
 	return l()
 }
 
-func (j jsonObj) String() string {
-	switch j.typeof() {
-	case "string":
-		return "\"" + strings.ReplaceAll(j.asString(), "\"", "\\\"") + "\""
-	case "array":
-		sb := &strings.Builder{}
-		sb.WriteString("[")
-		first := true
-		for i := 0; i < j.len(); i++ {
-			if first {
-				first = false
-			} else {
-				sb.WriteString(",")
-			}
-			sb.WriteString(j.getJson(i).String())
-		}
-		sb.WriteString("]")
-		return sb.String()
-	case "object":
-		sb := &strings.Builder{}
-		sb.WriteString("{")
-		first := true
-		for _, key := range j.keys() {
-			if first {
-				first = false
-			} else {
-				sb.WriteString(",")
-			}
-			sb.WriteString(jsonV(key).String())
-			sb.WriteString(":")
-			sb.WriteString(j.getJson(key).String())
-		}
-		sb.WriteString("}")
-		return sb.String()
-	default:
-		return fmt.Sprint(j.v)
-	}
-}
-
 func (j jsonObj) equals(obj jsonObj) bool {
 	if j.v == nil || obj.v == nil {
 		return j.v == nil && obj.v == nil
@@ -176,27 +142,37 @@ func (j jsonObj) equals(obj jsonObj) bool {
 	return false
 }
 
-func testEqual(t *testing.T, actual any, expected any, msg any) {
+func (t myT) jsonV(value any) jsonObj {
+	var result any
+	t.failNowIfErr(json.Unmarshal([]byte(r1(json.Marshal(value)).check(t)), &result))
+	return jsonV(result)
+}
+
+func (t myT) testEqual(actual any, expected any, msg any) {
+	//if !t.jsonV(actual).equals(t.jsonV(expected)) {
 	if !jsonV(actual).equals(jsonV(expected)) {
-		die(t, fmt.Sprintf("%s: expected <%v> but got <%v>", msg, expected, actual))
+		die(t, fmt.Sprintf("%s: expected\n <%v> but got\n <%v>", msg, expected, actual))
 	}
 }
 
-func failNowIfNot(t *testing.T, cond bool, msg any) {
+func (t myT) failNowIfNot(cond bool, msg any) {
 	if !cond {
 		die(t, msg)
 	}
 }
 
-func failNowIfErr(t *testing.T, err any) {
+func (t myT) failNowIfErr(err any) {
 	if err != nil {
 		die(t, err)
 	}
 }
 
 type testServer struct {
-	t   *testing.T
-	mux *http.ServeMux
+	t          myT
+	mux        *http.ServeMux
+	service    *LeisureService
+	blockNames map[Sha]string
+	history    *history.History
 }
 
 func (sv *testServer) Error(args ...any) {
@@ -262,7 +238,7 @@ func cookieFor(url []any) *http.Cookie {
 
 func (sv *testServer) get(url ...any) (*http.Request, *MockResponseWriter) {
 	req, resp := sv.route(sv.mux, http.MethodGet, urlFor(url), cookieFor(url), "")
-	testEqual(sv.t, resp.status, http.StatusOK, lazy(func() string {
+	sv.t.testEqual(resp.status, http.StatusOK, lazy(func() string {
 		return fmt.Sprintf("Unsuccessful request: %s", resp.buf.String())
 	}))
 	return req, resp
@@ -272,36 +248,42 @@ func (sv *testServer) post(url ...any) (*http.Request, *MockResponseWriter) {
 	body := url[len(url)-1]
 	url = url[:len(url)-1]
 	req, resp := sv.route(sv.mux, http.MethodPost, urlFor(url), cookieFor(url), fmt.Sprint(body))
-	testEqual(sv.t, resp.status, http.StatusOK, lazy(func() string {
+	sv.t.testEqual(resp.status, http.StatusOK, lazy(func() string {
 		return fmt.Sprintf("Unsuccessful request: %s", resp.buf.String())
 	}))
 	return req, resp
 }
 
-func createServer(t *testing.T, name string) (*LeisureService, *testServer) {
-	mux := http.NewServeMux()
-	ws := Initialize(name, mux, MemoryStorage)
-	sv := &testServer{
-		t:   t,
-		mux: mux,
-	}
-	return ws, sv
+func (sv *testServer) shutdown() {
+	sv.service.shutdown()
 }
 
-func TestCreate(t *testing.T) {
-	ws, sv := createServer(t, "test")
+func (t myT) createServer(name string) *testServer {
+	mux := http.NewServeMux()
+	ws := Initialize(name, mux, MemoryStorage)
+	return &testServer{
+		t:          t,
+		mux:        mux,
+		service:    ws,
+		blockNames: map[Sha]string{},
+	}
+}
+
+func TestCreate(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
 	_, resp := sv.post(DOC_CREATE, UUID, "?", "alias", "fred", "bob content")
 	_, resp = sv.get(DOC_LIST)
-	testEqual(t, resp.buf.String(), "[[\""+UUID+"\",\"fred\"]]", "Bad document list")
+	t.testEqual(resp.buf.String(), "[[\""+UUID+"\",\"fred\"]]", "Bad document list")
 	_, resp = sv.get(SESSION_CREATE, "s1", "fred")
 	_, resp = sv.get(SESSION_LIST)
-	session := ws.sessions["s1"]
+	session := sv.service.sessions["s1"]
 	l := session.History.Latest[session.Peer]
 	if l == nil {
 		l = session.History.Source
 	}
-	testEqual(t, l.GetDocument(session.History).String(), "bob content", "Documents are not the same")
-	ws.shutdown()
+	t.testEqual(l.GetDocument(session.History).String(), "bob content", "Documents are not the same")
+	sv.shutdown()
 }
 
 const UUID = "0e21af6b-edf7-4d1a-b6e0-439d878424b0"
@@ -321,7 +303,7 @@ line three
 line four
 line five`
 
-func (w *MockResponseWriter) jsonDecode(t *testing.T) jsonObj {
+func (w *MockResponseWriter) jsonDecode(t myT) jsonObj {
 	var obj any
 	if err := json.Unmarshal(w.buf.Bytes(), &obj); err != nil {
 		die(t, err)
@@ -329,7 +311,7 @@ func (w *MockResponseWriter) jsonDecode(t *testing.T) jsonObj {
 	return jsonV(obj)
 }
 
-func jsonEncode(t *testing.T, obj any) string {
+func (t myT) jsonEncode(obj any) string {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		die(t, err)
@@ -360,43 +342,42 @@ func index(str string, line, col int) int {
 	return i + col
 }
 
-func (sv *testServer) cookie(req *http.Request, resp *MockResponseWriter) *http.Cookie {
-	return sv.cookies(req, resp)[0]
-}
-
-func (sv *testServer) cookies(req *http.Request, resp *MockResponseWriter) []*http.Cookie {
+func (sv *testServer) processGet(url ...any) ([]*http.Cookie, string) {
+	req, resp := sv.get(url...)
+	body := resp.buf.String()
 	buf := &bytes.Buffer{}
 	resp.header.Write(buf)
 	resp.WriteHeader(resp.status)
 	if hresp, err := http.ReadResponse(resp.createResponse(), req); err != nil {
 		sv.die(err)
-		return nil
+		return nil, ""
 	} else {
-		return hresp.Cookies()
+		return hresp.Cookies(), body
 	}
 }
 
-func TestEdits(t *testing.T) {
-	ws, sv := createServer(t, "test")
+func TestEdits(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
 	sv.post(DOC_CREATE, UUID, "?", "alias", "fred", doc1)
-	c := sv.cookies(sv.get(SESSION_CREATE, "emacs", "fred"))
-	testEqual(t, len(c), 1, "Bad number of cookies")
+	c, _ := sv.processGet(SESSION_CREATE, "emacs", "fred")
+	t.testEqual(len(c), 1, "Bad number of cookies")
 	cookie := c[0]
 	keyValue := strings.Split(cookie.Value, "=")
-	testEqual(t, len(keyValue), 2, fmt.Sprintf("Bad cookie format, expected SESSION_ID=SESSION_KEY but got %s", cookie.Value))
+	t.testEqual(len(keyValue), 2, fmt.Sprintf("Bad cookie format, expected SESSION_ID=SESSION_KEY but got %s", cookie.Value))
 	_, resp := sv.get(SESSION_GET, cookie)
-	testEqual(t, resp.buf.String(), doc1, "Bad document")
+	t.testEqual(resp.buf.String(), doc1, "Bad document")
 	d1 := doc.NewDocument(doc1)
 	d1.Replace("emacs", index(d1.String(), 0, 5), 3, "ONE")
 	d1.Replace("emacs", index(d1.String(), 2, 10), 0, "\nline four")
-	_, resp = sv.post(SESSION_EDIT, cookie, jsonEncode(t, jmap(
+	_, resp = sv.post(SESSION_EDIT, cookie, t.jsonEncode(jmap(
 		"replacements", replacements(d1.Edits()),
 		"selectionOffset", 0,
 		"selectionLength", 0,
 	)))
 	_, resp = sv.get(SESSION_GET, cookie)
-	testEqual(t, resp.buf.String(), doc1Edited, "bad document")
-	ws.shutdown()
+	t.testEqual(resp.buf.String(), doc1Edited, "bad document")
+	sv.shutdown()
 }
 
 func responseString(w *MockResponseWriter) any {
@@ -426,54 +407,181 @@ func testFetchArgs(count int, args []any, formatErr string) (func(*MockResponseW
 func (sv *testServer) testGet(args ...any) {
 	transform, args, expected, errMsg := testFetchArgs(3, args, "bad use of testGet")
 	_, resp := sv.get(args...)
-	testEqual(sv.t, transform(resp), expected, errMsg)
+	sv.t.testEqual(transform(resp), expected, errMsg)
 }
 
 // testPost([transform-func], URL, args..., data, expected, errorMessage)
 func (sv *testServer) testPost(args ...any) {
 	transform, args, expected, errMsg := testFetchArgs(4, args, "bad use of testPost")
 	_, resp := sv.post(args...)
-	testEqual(sv.t, transform(resp), expected, errMsg)
+	sv.t.testEqual(transform(resp), expected, errMsg)
 }
 
-func TestTwoPeers(t *testing.T) {
-	ws, sv := createServer(t, "test")
+func (t myT) repls(args ...any) []doc.Replacement {
+	replacements := make([]doc.Replacement, 0, len(args)/3)
+	for i := 0; i+2 < len(args); i += 3 {
+		off, ok := args[i].(int)
+		t.failNowIfNot(ok, "bad cast")
+		length, ok := args[i+1].(int)
+		t.failNowIfNot(ok, "bad cast")
+		text, ok := args[i+2].(string)
+		t.failNowIfNot(ok, "bad cast")
+		replacements = append(replacements, doc.Replacement{
+			Offset: off,
+			Length: length,
+			Text:   text,
+		})
+	}
+	return replacements
+}
+
+func (t myT) edit(selOff, selLen int, repls ...any) map[string]any {
+	//fmt.Fprintf(os.Stderr, "Replacements: %v\n", t.jsonEncode(jmap(
+	//	"selectionOffset", selOff,
+	//	"selectionLength", selLen,
+	//	"replacements", t.repls(repls...))))
+	return jmap(
+		"selectionOffset", selOff,
+		"selectionLength", selLen,
+		"replacements", t.repls(repls...))
+}
+
+func TestTwoPeers(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
 	sv.post(DOC_CREATE, "0000", "?", "alias", "bubba", "hello there")
-	emacs := sv.cookie(sv.get(SESSION_CREATE, "emacs", "bubba"))
-	vscode := sv.cookie(sv.get(SESSION_CREATE, "vscode", "bubba"))
-	sv.post(SESSION_EDIT, vscode,
-		`{
-  "selectionOffset":0,
-  "selectionLength":0,
-  "replacements": [
-    {
-      "offset": 6,
-      "length": 5,
-      "text": "goodbye"
-    }
-  ]
-}`)
+	cookies, body := sv.processGet(SESSION_CREATE, "emacs", "bubba")
+	t.testEqual(body, "hello there", "bad response for create")
+	emacs := cookies[0]
+	cookies, body = sv.processGet(SESSION_CREATE, "vscode", "bubba")
+	t.testEqual(body, "hello there", "bad response for create")
+	vscode := cookies[0]
+	sv.post(SESSION_EDIT, vscode, t.jsonEncode(
+		t.edit(0, 0,
+			6, 5, "goodbye")))
 	sv.testGet(SESSION_GET, vscode, "hello goodbye", "Unexpected document")
 	sv.testGet(sv.jsonDecode, SESSION_UPDATE, emacs, true, "Expected update")
 	sv.testGet(SESSION_GET, emacs, "hello there", "Unexpected document")
-	session := ws.sessions["emacs"]
+	session := sv.service.sessions["emacs"]
 	fmt.Printf("EMACS: %v\n", session.Peer)
 	fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.Peer])
+	jrepl := jsonV(&doc.Replacement{Offset: 1, Length: 2, Text: "three"})
+	expectedRepl := jmap("offset", 1, "length", 2, "text", "three")
+	t.testEqual(expectedRepl, jrepl, "Bad comparison")
 	sv.testPost(sv.jsonDecode, SESSION_EDIT, emacs,
-		`{
-	  "selectionOffset":0,
-	  "selectionLength":0,
-	  "replacements": []
-	}`, jmap(
-			"selectionOffset", -1,
-			"selectionLength", -1,
-			"replacements", []doc.Replacement{
-				{
-					Offset: 6,
-					Length: 5,
-					Text:   "goodbye"},
-			}),
+		t.jsonEncode(t.edit(0, 0)),
+		t.edit(-1, -1, 6, 5, "goodbye"),
 		"Bad replacement")
 	sv.testGet(SESSION_GET, emacs, "hello goodbye", "Unexpected document")
-	ws.shutdown()
+	sv.shutdown()
+}
+
+func TestPeerEdits(tt *testing.T) {
+	lines := 2
+	word := "hello "
+	words := 2
+	// these each produce a different error
+	//inserts := []int{17, 15, 23}
+	inserts := []int{1, 1, 1}
+	t := myT{tt}
+	sv := t.createServer("test")
+	docBuf := strings.Builder{}
+	for line := 0; line < lines; line++ {
+		for wordNum := 0; wordNum < words; wordNum++ {
+			docBuf.WriteString(word)
+		}
+		docBuf.WriteString("\n")
+	}
+	sv.post(DOC_CREATE, "0000", "?", "alias", "bubba", docBuf.String())
+	sv.history = sv.service.documents["0000"]
+	sv.addBlock(sv.history.Source)
+	cookies, _ := sv.processGet(SESSION_CREATE, "emacs", "bubba")
+	emacs := cookies[0]
+	cookies, _ = sv.processGet(SESSION_CREATE, "vscode", "bubba")
+	vscode := cookies[0]
+	for _, offset := range inserts {
+		sv.change("emacs", "vscode", emacs, vscode, offset, 0, "a")
+	}
+	sv.shutdown()
+}
+
+func (sv *testServer) addBlock(blk *history.OpBlock) {
+	if sv.blockNames[blk.Hash] != "" {
+		return
+	}
+	n := len(sv.blockNames)
+	sb := strings.Builder{}
+	for {
+		i := n % 52
+		c := 'a' + i
+		if i >= 26 {
+			c = 'A' + (i - 26)
+		}
+		fmt.Fprintf(&sb, "%c", c)
+		n = n / 52
+		if n == 0 {
+			break
+		}
+	}
+	sv.blockNames[blk.Hash] = sb.String()
+}
+
+func (sv *testServer) printBlockOrder() {
+	sb := strings.Builder{}
+	for _, hash := range sv.history.BlockOrder {
+		sb.WriteString(" " + sv.blockNames[hash])
+	}
+	fmt.Printf("block order:%s\n", sb.String())
+}
+
+func (sv *testServer) session(name string) *LeisureSession {
+	return sv.service.sessions[name]
+}
+
+func (sv *testServer) latest(sessionName string) *history.OpBlock {
+	return sv.session(sessionName).latestBlock()
+}
+
+func (sv *testServer) block(blk *history.OpBlock) string {
+	return sv.blockNames[blk.Hash]
+}
+
+func (sv *testServer) printBlock(blk *history.OpBlock) {
+	sb := &strings.Builder{}
+	fmt.Fprintf(sb, "Block: %s[%s]:", sv.block(blk), blk.Peer)
+	for _, p := range blk.Parents {
+		parent := sv.history.GetBlock(p)
+		fmt.Fprintf(sb, " %s[%s]", sv.blockNames[p], parent.Peer)
+	}
+	fmt.Println(sb.String())
+}
+
+func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offset, length int, text string) {
+	fmt.Printf("replace %d %d %s\n", offset, length, text)
+	h := sv.service.sessions[s1].History
+	doc1 := sv.latest(s1).GetDocument(h)
+	doc2 := sv.latest(s2).GetDocument(h)
+	sv.testPost(sv.jsonDecode, SESSION_EDIT, cookie1, sv.t.jsonEncode(
+		sv.t.edit(0, 0,
+			offset, length, text)),
+		sv.t.edit(-1, -1),
+		"bad edit result",
+	)
+	sv.addBlock(sv.latest(s1))
+	sv.printBlock(sv.latest(s1))
+	sv.printBlockOrder()
+	newDoc1 := sv.service.sessions[s1].latestBlock().GetDocument(h)
+	sv.t.failNowIfNot(doc1.String() != newDoc1.String(), "document is unchanged")
+	sv.t.failNowIfNot(len(doc1.String())+len(text) == len(newDoc1.String()), "new document size is wrong")
+	sv.testPost(sv.jsonDecode, SESSION_EDIT, cookie2, sv.t.jsonEncode(sv.t.edit(0, 0)),
+		sv.t.edit(-1, -1, offset, length, text),
+		"bad edit result",
+	)
+	sv.addBlock(sv.latest(s2))
+	sv.printBlock(sv.latest(s2))
+	sv.printBlockOrder()
+	newDoc2 := sv.service.sessions[s2].latestBlock().GetDocument(h)
+	sv.t.failNowIfNot(doc2.String() != newDoc2.String(), "document is unchanged")
+	sv.t.failNowIfNot(len(doc2.String())+len(text) == len(newDoc2.String()), "new document size is wrong")
+	sv.t.failNowIfNot(newDoc1.String() == newDoc2.String(), "documents are not equal")
 }
