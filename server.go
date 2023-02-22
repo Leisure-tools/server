@@ -67,7 +67,6 @@ type LeisureService struct {
 	logger          *log.Logger
 	service         chanSvc
 	storageFactory  func(docId, content string) hist.DocStorage
-	updates         map[*LeisureSession]chan bool
 	cookieTimeout   time.Duration
 	verbosity       int
 }
@@ -96,6 +95,7 @@ const (
 	DOC_CREATE      = VERSION + "/doc/create/"
 	DOC_GET         = VERSION + "/doc/get/"
 	DOC_LIST        = VERSION + "/doc/list"
+	SESSION_CLOSE   = VERSION + "/session/close"
 	SESSION_CONNECT = VERSION + "/session/connect/"
 	SESSION_CREATE  = VERSION + "/session/create/"
 	SESSION_LIST    = VERSION + "/session/list"
@@ -166,6 +166,7 @@ func (session *LeisureSession) connect(w http.ResponseWriter) {
 		MaxAge:   int(session.service.cookieTimeout / time.Second),
 		HttpOnly: true,
 	}
+	session.service.verbose("New session cookie: %v", session.key)
 	session.lastUsed = time.Now()
 }
 
@@ -204,6 +205,18 @@ func (sv *LeisureContext) writeRawError(err error) {
 	if sv.verbosity > 0 {
 		debug.PrintStack()
 	}
+	// clear out session
+	if sv.session.updates != nil {
+		close(sv.session.updates)
+		sv.session.hasUpdate = false
+	}
+	http.SetCookie(sv.w, &http.Cookie{
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+	})
 	sv.w.WriteHeader(http.StatusBadRequest)
 	sv.w.Write(ErrorJSONBytes(err))
 }
@@ -354,7 +367,6 @@ func (sv *LeisureContext) sessionCreate() {
 	sv.svcSync(func() {
 		docId, p := sv.getDocId(sv.r)
 		sessionId := path.Base(p)
-		//fmt.Println("docId:", docId, "sessionId:", sessionId)
 		if docId == "" {
 			sv.writeError(ErrCommandFormat, "No document ID. Session create requires a session ID and a document ID")
 		} else if sessionId == "" {
@@ -364,7 +376,6 @@ func (sv *LeisureContext) sessionCreate() {
 		} else if sv.sessions[sessionId] != nil {
 			sv.writeError(ErrDuplicateSession, "There is already a session named %s", sessionId)
 		} else {
-			//fmt.Printf("Create session: %s on document %s\n", sessionId, docId)
 			session := sv.addSession(sessionId, docId)
 			if sv.r.Method == http.MethodPost {
 				if incoming, err := io.ReadAll(sv.r.Body); err != nil {
@@ -385,6 +396,17 @@ func (sv *LeisureContext) sessionCreate() {
 			}
 			sv.writeSuccess(session.latestBlock().GetDocument(session.History))
 		}
+	})
+}
+
+// URL: /session/close
+// Close the session, if it exists
+func (sv *LeisureContext) sessionClose() {
+	sv.jsonResponseSvc(func() (any, error) {
+		if sv.session != nil {
+			delete(sv.sessions, sv.session.sessionId)
+		}
+		return true, nil
 	})
 }
 
@@ -424,7 +446,6 @@ func (sv *LeisureContext) sessionList() {
 		sessions := []string{}
 		for name := range sv.sessions {
 			sessions = append(sessions, name)
-			//fmt.Println("session:", name)
 		}
 		sv.writeResponse(sessions)
 	})
@@ -440,7 +461,6 @@ func (sv *LeisureContext) sessionList() {
 // returns whether the body contained changes to the session's document
 func (sv *LeisureContext) sessionConnect() {
 	sv.jsonResponseSvc(func() (any, error) {
-		fmt.Fprintln(os.Stderr, "Got session connect:", sv.r.URL)
 		if sessionId, ok := urlTail(sv.r, SESSION_CONNECT); !ok {
 			return nil, sv.error(ErrCommandFormat, "Bad connect format, should be %sID but was %s", SESSION_CONNECT, sv.r.URL.RequestURI())
 		} else {
@@ -452,7 +472,7 @@ func (sv *LeisureContext) sessionConnect() {
 			}
 			if session := sv.sessions[sessionId]; session == nil && docId == "" {
 				return nil, sv.error(ErrUnknownSession, "No session %s", sessionId)
-			} else if session != nil && !force {
+			} else if session != nil && sv.findSession(sv.r) == nil && !force {
 				return nil, sv.error(ErrDuplicateConnection, "There is already a connection for %s", sessionId)
 			} else if sv.r.Method == http.MethodPost {
 				if incoming, err := io.ReadAll(sv.r.Body); err != nil {
@@ -478,12 +498,12 @@ func (sv *LeisureContext) sessionConnect() {
 					return true, nil
 				}
 			} else if session != nil {
-				session.connect(sv.w)
+				//session.connect(sv.w)
+				session.lastUsed = time.Now()
 				sv.session = session
 			} else if history == nil {
 				return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
 			} else {
-				fmt.Fprintln(os.Stderr, "Adding session", sessionId, docId)
 				sv.session = sv.addSessionWithHistory(sessionId, history)
 			}
 			content := sv.session.latestBlock().GetDocument(sv.session.History).String()
@@ -555,7 +575,6 @@ func (sv *LeisureContext) sessionEdit() {
 				err = sv.error(errObj, "")
 			}
 		}()
-		//fmt.Printf("\nREPLACE: %v\n\n", repls)
 		if err := sv.checkSession(); err != nil {
 			return nil, sv.error(err, "")
 		} else if !repls.isMap() {
@@ -574,7 +593,6 @@ func (sv *LeisureContext) sessionEdit() {
 			l := repls.len()
 			for i := 0; i < l; i++ {
 				el := repls.getJson(i)
-				//fmt.Println("OBJ:", obj.v, "EL:", el.v)
 				if !el.isMap() {
 					println("NOT MAP")
 					return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
@@ -583,7 +601,6 @@ func (sv *LeisureContext) sessionEdit() {
 				length := el.getJson("length")
 				text := el.getJson("text")
 				if !(offset.isNumber() && length.isNumber() && (text.isNil() || text.isString())) {
-					//fmt.Printf("BAD ARGS OFFSET: %v, LENGTH: %v, TEXT: %v", offset.v, length.v, text.v)
 					return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
 				} else if text.isNil() {
 					text = jsonV("")
@@ -606,33 +623,45 @@ func (sv *LeisureContext) sessionEdit() {
 			blk := sv.session.latestBlock()
 			blk.GetDocument(sv.session.History).Apply(blk.Peer, repl)
 			// done validating inputs
-			sv.verbose("edit: %v", repls)
+			sv.verbose("edit: %v", repl)
 			sv.session.ReplaceAll(repl)
+			sv.session.hasUpdate = false
 			result, off, length := sv.session.Commit(offset.asInt(), length.asInt())
-			latest := sv.session.History.LatestHashes()
 			if len(repl) > 0 {
 				for _, s := range sv.sessions {
 					if s == sv.session || s.hasUpdate {
 						continue
 					}
-					oldLatest := s.History.Latest[s.Peer]
-					if oldLatest == nil {
-						oldLatest = s.History.Source
-					}
-					//fmt.Printf("VARS:\n  session: %v\n  oldLatest: %v\n", session, oldLatest)
-					if !hist.SameHashes(latest, oldLatest.Parents) {
-						s.hasUpdate = true
-						if s.updates != nil {
-							// no need to potentially block here
-							curSession := s
-							go func() { curSession.updates <- true }()
-						}
+					s.hasUpdate = true
+					if s.updates != nil {
+						// no need to potentially block here
+						curSession := s
+						go func() { curSession.updates <- true }()
 					}
 				}
 			}
 			return jmap("replacements", result, "selectionOffset", off, "selectionLength", length), nil
 		}
 	})
+}
+
+// return whether there is actually new data
+// hashes may have changed but new blocks might all be empty
+func hasNewData(h *hist.History, parents []Sha) bool {
+	//return !hist.SameHashes(h.LatestHashes(), parents)
+	latest := h.LatestHashes()
+	if !hist.SameHashes(latest, parents) {
+		// check for nontrivial descendants
+		h.GetBlockOrder()
+		for _, parentHash := range parents {
+			for descHash := range h.GetBlock(parentHash).GetDescendants() {
+				if descHash != parentHash && len(h.GetBlock(descHash).Replacements) > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func asError(err any) error {
@@ -667,10 +696,10 @@ func (sv *LeisureContext) sessionUpdate() {
 	ch := make(chan bool)
 	svc(sv.service, func() {
 		err := sv.checkSession()
-		if err == nil && !sv.session.hasUpdate && sv.session.updates == nil {
+		if err == nil && !sv.session.hasUpdate {
 			timer := time.After(2 * time.Minute)
-			newUpdates := make(chan bool)
 			oldUpdates := sv.session.updates
+			newUpdates := make(chan bool)
 			sv.session.updates = newUpdates
 			go func() {
 				hadUpdate := false
@@ -679,10 +708,10 @@ func (sv *LeisureContext) sessionUpdate() {
 				case <-timer:
 				}
 				sv.jsonResponseSvc(func() (any, error) {
+					if oldUpdates != nil {
+						go func() { oldUpdates <- hadUpdate }()
+					}
 					if sv.session.updates == newUpdates {
-						if oldUpdates != nil {
-							go func() { oldUpdates <- hadUpdate }()
-						}
 						sv.session.updates = nil
 						sv.session.hasUpdate = false
 					}
@@ -693,9 +722,12 @@ func (sv *LeisureContext) sessionUpdate() {
 		} else {
 			sv.jsonResponse(func() (any, error) {
 				if err != nil {
-					err = sv.error(err, "")
+					return nil, sv.error(err, "")
 				}
-				return true, err
+				if sv.session.updates != nil {
+					sv.session.updates <- true
+				}
+				return true, nil
 			})
 			ch <- true
 		}
@@ -797,6 +829,7 @@ func Initialize(id string, mux *http.ServeMux, storageFactory func(string, strin
 	sv.handle(mux, DOC_LIST, (*LeisureContext).docList)
 	sv.handle(mux, DOC_GET, (*LeisureContext).docGet)
 	sv.handle(mux, SESSION_CREATE, (*LeisureContext).sessionCreate)
+	sv.handle(mux, SESSION_CLOSE, (*LeisureContext).sessionClose)
 	sv.handle(mux, SESSION_LIST, (*LeisureContext).sessionList)
 	sv.handle(mux, SESSION_CONNECT, (*LeisureContext).sessionConnect)
 	sv.handle(mux, SESSION_EDIT, (*LeisureContext).sessionEdit)
