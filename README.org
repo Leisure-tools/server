@@ -1,0 +1,49 @@
+#+TITLE: Leisure server
+HTTP server and command line tools for Leisure.
+
+* API
+** Create a document
+- =/v1/doc/create/ID=
+- =/v1/doc/create/ID?alias=ALIAS=
+
+If no ID is given one will be created
+
+Body is the document content
+
+Returns a JSON string  the document ID
+
+** list documents
+- =/v1/doc/list=
+
+returns a JSON list of each document and its alias (or null if there is none)
+
+** Create a session
+- =/v1/session/create/=
+
+** Connect and get a session key
+- =/v1/session/connect/SESSION_NAME=
+- =/v1/session/connect/SESSION_NAME?docId=ID=
+
+With docId, it will automatically create a session on the given document
+
+** List sessions
+- =/v1/session/list=
+
+** Get the document for a session
+- =/v1/session/get/=
+
+** Make replacements in a session
+- =/v1/session/replace=
+
+Body is a JSON struct like this:
+
+#+begin_src json
+{...}
+#+end_src
+
+
+** Check for an update
+- =/v1/session/update=?minutes=2
+
+Will wait for a given number of minutes for an update (defaults to 2). If this returns true,
+there is an update and the client should make a replacement.

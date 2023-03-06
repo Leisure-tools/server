@@ -365,7 +365,7 @@ func TestEdits(tt *testing.T) {
 	cookie := c[0]
 	keyValue := strings.Split(cookie.Value, "=")
 	t.testEqual(len(keyValue), 2, fmt.Sprintf("Bad cookie format, expected SESSION_ID=SESSION_KEY but got %s", cookie.Value))
-	_, resp := sv.get(SESSION_GET, cookie)
+	_, resp := sv.get(SESSION_DOCUMENT, cookie)
 	t.testEqual(resp.buf.String(), doc1, "Bad document")
 	d1 := doc.NewDocument(doc1)
 	d1.Replace("emacs", index(d1.String(), 0, 5), 3, "ONE")
@@ -375,7 +375,7 @@ func TestEdits(tt *testing.T) {
 		"selectionOffset", 0,
 		"selectionLength", 0,
 	)))
-	_, resp = sv.get(SESSION_GET, cookie)
+	_, resp = sv.get(SESSION_DOCUMENT, cookie)
 	t.testEqual(resp.buf.String(), doc1Edited, "bad document")
 	sv.shutdown()
 }
@@ -459,9 +459,9 @@ func TestTwoPeers(tt *testing.T) {
 	sv.post(SESSION_EDIT, vscode, t.jsonEncode(
 		t.edit(0, 0,
 			6, 5, "goodbye")))
-	sv.testGet(SESSION_GET, vscode, "hello goodbye", "Unexpected document")
+	sv.testGet(SESSION_DOCUMENT, vscode, "hello goodbye", "Unexpected document")
 	sv.testGet(sv.jsonDecode, SESSION_UPDATE, emacs, true, "Expected update")
-	sv.testGet(SESSION_GET, emacs, "hello there", "Unexpected document")
+	sv.testGet(SESSION_DOCUMENT, emacs, "hello there", "Unexpected document")
 	session := sv.service.sessions["emacs"]
 	fmt.Printf("EMACS: %v\n", session.Peer)
 	fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.Peer])
@@ -470,9 +470,9 @@ func TestTwoPeers(tt *testing.T) {
 	t.testEqual(expectedRepl, jrepl, "Bad comparison")
 	sv.testPost(sv.jsonDecode, SESSION_EDIT, emacs,
 		t.jsonEncode(t.edit(0, 0)),
-		t.edit(-1, -1, 6, 5, "goodbye"),
+		t.edit(0, 0, 6, 5, "goodbye"),
 		"Bad replacement")
-	sv.testGet(SESSION_GET, emacs, "hello goodbye", "Unexpected document")
+	sv.testGet(SESSION_DOCUMENT, emacs, "hello goodbye", "Unexpected document")
 	sv.shutdown()
 }
 
@@ -564,7 +564,7 @@ func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offse
 	sv.testPost(sv.jsonDecode, SESSION_EDIT, cookie1, sv.t.jsonEncode(
 		sv.t.edit(0, 0,
 			offset, length, text)),
-		sv.t.edit(-1, -1),
+		sv.t.edit(0, 0),
 		"bad edit result",
 	)
 	sv.addBlock(sv.latest(s1))
@@ -574,7 +574,7 @@ func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offse
 	sv.t.failNowIfNot(doc1.String() != newDoc1.String(), "document is unchanged")
 	sv.t.failNowIfNot(len(doc1.String())+len(text) == len(newDoc1.String()), "new document size is wrong")
 	sv.testPost(sv.jsonDecode, SESSION_EDIT, cookie2, sv.t.jsonEncode(sv.t.edit(0, 0)),
-		sv.t.edit(-1, -1, offset, length, text),
+		sv.t.edit(0, 0, offset, length, text),
 		"bad edit result",
 	)
 	sv.addBlock(sv.latest(s2))
@@ -584,4 +584,42 @@ func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offse
 	sv.t.failNowIfNot(doc2.String() != newDoc2.String(), "document is unchanged")
 	sv.t.failNowIfNot(len(doc2.String())+len(text) == len(newDoc2.String()), "new document size is wrong")
 	sv.t.failNowIfNot(newDoc1.String() == newDoc2.String(), "documents are not equal")
+}
+
+func TestOrgEdit(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
+	doc := `#+begin_src maluba
+frood
+#+end_src
+`
+	sv.post(DOC_CREATE, "0000", "?", "alias", "bubba", doc)
+	sv.history = sv.service.documents["0000"]
+	sv.addBlock(sv.history.Source)
+	cookies, _ := sv.processGet(SESSION_CREATE, "emacs", "bubba")
+	emacs := cookies[0]
+	cookies, _ = sv.processGet(SESSION_CREATE, "vscode", "bubba", "?", "org", "true")
+	vscode := cookies[0]
+	sv.testPost(sv.jsonDecode, SESSION_EDIT, emacs, sv.t.jsonEncode(
+		sv.t.edit(0, 0, 12, 6, "julia")),
+		sv.t.edit(0, 0),
+		"bad edit result",
+	)
+	expected := sv.t.edit(0, 0, 12, 6, "julia")
+	changedBlock := jmap(
+		"content", 18,
+		"end", 24,
+		"id", "chunk-1",
+		"label", 12,
+		"labelEnd", 17,
+		"text", doc[:12]+"julia"+doc[18:],
+		"type", "source",
+	)
+	expected["changed"] = []any{changedBlock}
+	sv.testPost(sv.jsonDecode, SESSION_EDIT, vscode,
+		sv.t.jsonEncode(sv.t.edit(0, 0)),
+		expected,
+		"bad edit result",
+	)
+	sv.shutdown()
 }

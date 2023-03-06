@@ -112,6 +112,9 @@ func baseValue(v reflect.Value) reflect.Value {
 }
 
 func (j jsonObj) len() int {
+	if j.v == nil {
+		return 0
+	}
 	t := j.baseType()
 	switch t.Kind() {
 	case reflect.Slice, reflect.Array, reflect.Map:
@@ -175,6 +178,12 @@ func (j jsonObj) keys() []string {
 }
 
 func (j jsonObj) get(key any) any {
+	if j.v == nil {
+		if _, ok := key.(string); ok {
+			return nil
+		}
+		panic("Attempt to index nil")
+	}
 	v := j.baseValue()
 	switch v.Kind() {
 	case reflect.Struct:
