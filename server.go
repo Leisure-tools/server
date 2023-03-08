@@ -725,7 +725,7 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		sv.session.hasUpdate = false
 		replacements, off, length := sv.session.Commit(offset.asInt(), length.asInt())
 		if offset.asInt() > 0 {
-			fmt.Printf("OFFSET: %d -> %d\n", offset.asInt(), off)
+			sv.verbose("OFFSET: %d -> %d\n", offset.asInt(), off)
 		}
 		return sv.changes(off, length, replacements, len(repl) > 0), nil
 	}
@@ -752,17 +752,17 @@ func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replace
 		result["selectionLength"] = selLen
 	}
 	if (sv.session.wantsOrg || sv.session.dataMode) && len(replacements) > 0 {
-		latest := sv.session.latestBlock()
-		prev := latest.PeerParent(sv.session.History).GetDocument(sv.session.History)
-		// apply latest replacements to reconstruct the peer's current document
-		prev.Apply("", latest.Replacements)
-		chunks := org.Parse(prev.String())
+		chunks := sv.session.chunks
 		changes := &org.ChunkChanges{}
 		for _, repl := range replacements {
+			sv.verbose("INITIAL TREE")
+			org.DisplayChunks("   ", chunks.Chunks)
 			changes.Merge(chunks.Replace(repl.Offset, repl.Length, repl.Text))
+			sv.verbose("FINAL TREE:\n")
+			org.DisplayChunks("    ", chunks.Chunks)
 		}
 		chunks.RelinkHierarchy(changes)
-		fmt.Printf("CHUNK CHANGES: %+v\n", changes)
+		sv.verbose("CHUNK CHANGES: %+v\n", changes)
 		linkCount := len(changes.Linked)
 		changeCount := len(changes.Added) + len(changes.Changed) + len(changes.Removed) + linkCount
 		if changeCount == 0 || (changeCount == linkCount && sv.session.dataMode) {
@@ -982,7 +982,7 @@ func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, valu
 	if newText, err := ch.SetValue(value.v); err != nil {
 		return nil, err
 	} else {
-		fmt.Println("NEW DATA:", newText)
+		sv.verbose("NEW DATA:", newText)
 		end += len(newText) - len(ch.AsOrgChunk().Text)
 		return sv.replaceText(-1, -1, offset+start, end-start, newText[start:end])
 	}
@@ -1133,6 +1133,7 @@ func (sv *LeisureService) verboseN(n int, format string, args ...any) {
 
 func (sv *LeisureService) SetVerbose(n int) {
 	sv.verbosity = n
+	org.SetVerbosity(n)
 }
 
 func Initialize(id string, mux *http.ServeMux, storageFactory func(string, string) hist.DocStorage) *LeisureService {
