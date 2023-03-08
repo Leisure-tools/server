@@ -113,6 +113,7 @@ const (
 	SESSION_GET      = VERSION + "/session/get/"
 	SESSION_SET      = VERSION + "/session/set/"
 	SESSION_REMOVE   = VERSION + "/session/remove/"
+	ORG_PARSE        = VERSION + "/org/parse"
 )
 
 func (err LeisureError) Error() string {
@@ -581,6 +582,14 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 	}
 }
 
+func (sv *LeisureContext) orgParse() (any, error) {
+	if incoming, err := io.ReadAll(sv.r.Body); err != nil {
+		return nil, sv.error(ErrCommandFormat, "Could not read document contents")
+	} else {
+		return org.Parse(string(incoming)), nil
+	}
+}
+
 func (sv *LeisureContext) selectedChunks(edits []doc.Replacement) []org.Chunk {
 	ch := make([]org.Chunk, 0, sv.session.chunks.Chunks.Measure().Count)
 	chSet := make(doc.Set[org.OrgId], cap(ch))
@@ -760,6 +769,7 @@ func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replace
 		} else if sv.session.dataMode {
 			return changes.DataChanges(chunks)
 		} else if changeCount > 0 {
+			result["order"] = changes.Order(chunks)
 			if !changes.Changed.IsEmpty() {
 				result["changed"] = sv.chunkSlice(chunks, changes.Changed)
 			}
@@ -1138,6 +1148,7 @@ func Initialize(id string, mux *http.ServeMux, storageFactory func(string, strin
 	sv.handle(mux, SESSION_UPDATE, (*LeisureContext).sessionUpdate)
 	sv.handleJsonResponse(mux, SESSION_GET, (*LeisureContext).sessionGet)
 	sv.handleJson(mux, SESSION_SET, (*LeisureContext).sessionSet)
+	sv.handleJsonResponse(mux, ORG_PARSE, (*LeisureContext).orgParse)
 	runSvc(sv.service)
 	return sv
 }
