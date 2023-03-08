@@ -535,6 +535,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 			if incoming, err := io.ReadAll(sv.r.Body); err != nil {
 				return nil, sv.error(ErrCommandFormat, "Could not read document contents")
 			} else if session != nil {
+				session.wantsOrg = wantsOrg
 				return addChanges(session, string(incoming)), nil
 			} else if history != nil {
 				session := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
@@ -556,7 +557,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 			}
 		} else if session != nil {
 			session.lastUsed = time.Now()
-			sv.session = session
+			session.wantsOrg = wantsOrg
 		} else if history == nil {
 			return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
 		} else {
