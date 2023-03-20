@@ -24,6 +24,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const UPDATE_TIME = 2 * time.Minute
+
 type Sha = [sha256.Size]byte
 
 type LeisureError struct {
@@ -467,7 +469,7 @@ func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStr
 
 func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool) *LeisureSession {
 	session := &LeisureSession{
-		Session:      hist.NewSession(fmt.Sprint(sv.unixSocket, '-', sessionId), history),
+		Session:      hist.NewSession(fmt.Sprint(sv.unixSocket, '-', sessionId), history, ""),
 		sessionId:    sessionId,
 		key:          nil,
 		service:      sv.LeisureService,
@@ -858,12 +860,14 @@ func (sv *LeisureContext) sessionDocument() {
 	}
 }
 
+// URL: GET /session/update -- return whether there is an update
+// if there is not yet an update, wait for one up to UPDATE_TIME before returning
 func (sv *LeisureContext) sessionUpdate() {
 	ch := make(chan bool)
 	svc(sv.service, func() {
 		err := sv.checkSession()
 		if err == nil && !sv.session.hasUpdate {
-			timer := time.After(2 * time.Minute)
+			timer := time.After(UPDATE_TIME)
 			oldUpdates := sv.session.updates
 			newUpdates := make(chan bool)
 			sv.session.updates = newUpdates
@@ -902,6 +906,7 @@ func (sv *LeisureContext) sessionUpdate() {
 }
 
 // URL: GET /session/get/NAME
+// get data for NAME
 func (sv *LeisureContext) sessionGet() (result any, err error) {
 	// set err if there's a panic
 	defer func() {

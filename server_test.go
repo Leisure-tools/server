@@ -304,8 +304,12 @@ line four
 line five`
 
 func (w *MockResponseWriter) jsonDecode(t myT) jsonObj {
+	return t.jsonDecode(w.buf.Bytes())
+}
+
+func (t myT) jsonDecode(bytes []byte) jsonObj {
 	var obj any
-	if err := json.Unmarshal(w.buf.Bytes(), &obj); err != nil {
+	if err := json.Unmarshal(bytes, &obj); err != nil {
 		die(t, err)
 	}
 	return jsonV(obj)
@@ -368,8 +372,8 @@ func TestEdits(tt *testing.T) {
 	_, resp := sv.get(SESSION_DOCUMENT, cookie)
 	t.testEqual(resp.buf.String(), doc1, "Bad document")
 	d1 := doc.NewDocument(doc1)
-	d1.Replace("emacs", index(d1.String(), 0, 5), 3, "ONE")
-	d1.Replace("emacs", index(d1.String(), 2, 10), 0, "\nline four")
+	d1.Replace("emacs", 0, index(d1.String(), 0, 5), 3, "ONE")
+	d1.Replace("emacs", 3, index(d1.String(), 2, 10), 0, "\nline four")
 	_, resp = sv.post(SESSION_EDIT, cookie, t.jsonEncode(jmap(
 		"replacements", replacements(d1.Edits()),
 		"selectionOffset", 0,
@@ -615,10 +619,11 @@ frood
 		"text", doc[:12]+"julia"+doc[18:],
 		"type", "source",
 	)
+	expected["order"] = []string{"chunk-1"}
 	expected["changed"] = []any{changedBlock}
 	sv.testPost(sv.jsonDecode, SESSION_EDIT, vscode,
-		sv.t.jsonEncode(sv.t.edit(0, 0)),
-		expected,
+		t.jsonEncode(t.edit(0, 0)),
+		t.jsonDecode([]byte(t.jsonEncode(expected))).v,
 		"bad edit result",
 	)
 	sv.shutdown()
