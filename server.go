@@ -17,6 +17,7 @@ import (
 	"time"
 
 	doc "github.com/leisure-tools/document"
+	"github.com/leisure-tools/history"
 	hist "github.com/leisure-tools/history"
 	"github.com/leisure-tools/org"
 	gouuid "github.com/nu7hatch/gouuid"
@@ -85,8 +86,11 @@ type LeisureContext struct {
 }
 
 type LeisureSession struct {
-	*hist.Session
-	sessionId    string
+	*history.History
+	Peer         string
+	SessionId    string
+	PendingOps   []doc.Replacement
+	Follow       string // track a sessionId when making new commits
 	key          *http.Cookie
 	service      *LeisureService
 	hasUpdate    bool
@@ -165,6 +169,26 @@ func jsonFor(data []byte) (any, error) {
 	return &msg, nil
 }
 
+// commit pending ops into an opBlock, get its document, and return the replacements
+// these will unwind the current document to the common ancestor and replay to the current version
+func (s *LeisureSession) Commit(selOff int, selLen int) ([]doc.Replacement, int, int) {
+	ops := s.PendingOps
+	s.PendingOps = s.PendingOps[:0]
+	return s.History.Commit(s.Peer, s.SessionId, ops, selOff, selLen)
+}
+
+// add a replacement to pendingOps
+func (s *LeisureSession) ReplaceAll(replacements []doc.Replacement) {
+	for _, repl := range replacements {
+		s.Replace(repl.Offset, repl.Length, repl.Text)
+	}
+}
+
+// add a replacement to pendingOps
+func (s *LeisureSession) Replace(offset int, length int, text string) {
+	s.PendingOps = append(s.PendingOps, doc.Replacement{Offset: offset, Length: length, Text: text})
+}
+
 func (session *LeisureSession) expired() bool {
 	return time.Now().Sub(session.lastUsed) > time.Duration(session.key.MaxAge*int(time.Second))
 }
@@ -175,7 +199,7 @@ func (session *LeisureSession) connect(w http.ResponseWriter) {
 	keyStr := hex.EncodeToString(key)
 	session.key = &http.Cookie{
 		Name:     "session",
-		Value:    session.sessionId + "=" + keyStr,
+		Value:    session.SessionId + "=" + keyStr,
 		Path:     "/",
 		MaxAge:   int(session.service.cookieTimeout / time.Second),
 		HttpOnly: true,
@@ -350,7 +374,7 @@ func (sv *LeisureService) getDocId(r *http.Request) (string, string) {
 func addChanges(session *LeisureSession, newDoc string) bool {
 	// check document and add edits to session
 	doc := session.latestBlock().GetDocument(session.History)
-	doc.Apply(session.Peer, session.PendingOps)
+	doc.Apply(session.SessionId, 0, session.PendingOps)
 	dmp := diff.New()
 	pos := 0
 	changed := false
@@ -445,7 +469,7 @@ func (sv *LeisureContext) sessionCreate() {
 // Close the session, if it exists
 func (sv *LeisureContext) sessionClose() (any, error) {
 	if sv.session != nil {
-		delete(sv.sessions, sv.session.sessionId)
+		delete(sv.sessions, sv.session.SessionId)
 	}
 	return true, nil
 }
@@ -469,8 +493,12 @@ func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStr
 
 func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool) *LeisureSession {
 	session := &LeisureSession{
-		Session:      hist.NewSession(fmt.Sprint(sv.unixSocket, '-', sessionId), history, ""),
-		sessionId:    sessionId,
+		Peer: "",
+		//SessionId:    fmt.Sprint(sv.unixSocket, '-', sessionId),
+		SessionId:    sessionId,
+		PendingOps:   make([]doc.Replacement, 0, 8),
+		History:      history,
+		Follow:       "",
 		key:          nil,
 		service:      sv.LeisureService,
 		hasUpdate:    false,
@@ -481,7 +509,7 @@ func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.
 		dataMode:     dataOnly,
 		chunks:       &org.OrgChunks{},
 	}
-	sv.sessions[sessionId] = session
+	sv.sessions[session.SessionId] = session
 	sv.session = session
 	session.connect(sv.w)
 	return session
@@ -654,9 +682,9 @@ func (sv *LeisureContext) error(errObj any, format string, args ...any) error {
 	args = append(append(make([]any, 0, len(args)+1), lerr), args...)
 	err := fmt.Errorf("%w:"+format, args...)
 	if sv.session != nil {
-		fmt.Fprintf(os.Stderr, "Session error for %s: %s\n%s", sv.session.Peer, err.Error(), debug.Stack())
+		fmt.Fprintf(os.Stderr, "Session error for %s: %s\n%s", sv.session.SessionId, err.Error(), debug.Stack())
 		debug.PrintStack()
-		sv.logger.Output(2, fmt.Sprintf("Connection %s got error: %s", sv.session.sessionId, err))
+		sv.logger.Output(2, fmt.Sprintf("Connection %s got error: %s", sv.session.SessionId, err))
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Session error [no session]: %s\n%s", err.Error(), debug.Stack())
@@ -718,9 +746,9 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 			}
 			repl = append(repl, curRepl)
 		}
-		// Apply will panic if there's a problem with repl and cause the defer to return an erorr
+		// Validate by using Apply, which panics on a repl problem, causing the defer to return an erorr
 		blk := sv.session.latestBlock()
-		blk.GetDocument(sv.session.History).Apply(blk.Peer, repl)
+		blk.GetDocument(sv.session.History).Apply(sv.session.SessionId, 0, repl)
 		// done validating inputs
 		sv.verbose("edit: %v", repl)
 		sv.session.ReplaceAll(repl)
@@ -842,7 +870,7 @@ func asError(err any) error {
 }
 
 func (session *LeisureSession) latestBlock() *hist.OpBlock {
-	blk := session.History.Latest[session.Peer]
+	blk := session.History.Latest[session.SessionId]
 	if blk == nil {
 		blk = session.History.Source
 	}
@@ -855,7 +883,7 @@ func (sv *LeisureContext) sessionDocument() {
 		sv.writeRawError(err)
 	} else {
 		doc := sv.session.latestBlock().GetDocument(sv.session.History)
-		doc.Apply(sv.session.Peer, sv.session.PendingOps)
+		doc.Apply(sv.session.SessionId, 0, sv.session.PendingOps)
 		sv.writeSuccess(doc.String())
 	}
 }
@@ -1070,11 +1098,11 @@ func (sv *LeisureContext) safeCall(fn func() (any, error)) (good any, bad error)
 }
 
 func (sv *LeisureContext) jsonResponse(fn func() (any, error)) {
-	peer := "no session"
+	sessionId := "no session"
 	if sv.session != nil {
-		peer = sv.session.Peer
+		sessionId = sv.session.SessionId
 	}
-	sv.verboseN(2, "Got %s request[%s]: %s", sv.r.Method, peer, sv.r.URL)
+	sv.verboseN(2, "Got %s request[%s]: %s", sv.r.Method, sessionId, sv.r.URL)
 	if obj, err := sv.safeCall(fn); err != nil {
 		sv.writeRawError(err)
 	} else {

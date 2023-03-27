@@ -278,7 +278,7 @@ func TestCreate(tt *testing.T) {
 	_, resp = sv.get(SESSION_CREATE, "s1", "fred")
 	_, resp = sv.get(SESSION_LIST)
 	session := sv.service.sessions["s1"]
-	l := session.History.Latest[session.Peer]
+	l := session.History.Latest[session.SessionId]
 	if l == nil {
 		l = session.History.Source
 	}
@@ -467,8 +467,8 @@ func TestTwoPeers(tt *testing.T) {
 	sv.testGet(sv.jsonDecode, SESSION_UPDATE, emacs, true, "Expected update")
 	sv.testGet(SESSION_DOCUMENT, emacs, "hello there", "Unexpected document")
 	session := sv.service.sessions["emacs"]
-	fmt.Printf("EMACS: %v\n", session.Peer)
-	fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.Peer])
+	fmt.Printf("EMACS: %v\n", session.SessionId)
+	fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.SessionId])
 	jrepl := jsonV(&doc.Replacement{Offset: 1, Length: 2, Text: "three"})
 	expectedRepl := jmap("offset", 1, "length", 2, "text", "three")
 	t.testEqual(expectedRepl, jrepl, "Bad comparison")
@@ -552,10 +552,10 @@ func (sv *testServer) block(blk *history.OpBlock) string {
 
 func (sv *testServer) printBlock(blk *history.OpBlock) {
 	sb := &strings.Builder{}
-	fmt.Fprintf(sb, "Block: %s[%s]:", sv.block(blk), blk.Peer)
+	fmt.Fprintf(sb, "Block: %s[%s]:", sv.block(blk), blk.SessionId)
 	for _, p := range blk.Parents {
 		parent := sv.history.GetBlock(p)
-		fmt.Fprintf(sb, " %s[%s]", sv.blockNames[p], parent.Peer)
+		fmt.Fprintf(sb, " %s[%s]", sv.blockNames[p], parent.SessionId)
 	}
 	fmt.Println(sb.String())
 }
