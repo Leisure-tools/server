@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"runtime/debug"
@@ -244,7 +245,7 @@ func (sv *LeisureContext) writeRawError(err error) {
 		debug.PrintStack()
 	}
 	// clear out session
-	if sv.session.updates != nil {
+	if sv.session != nil && sv.session.updates != nil {
 		close(sv.session.updates)
 		sv.session.hasUpdate = false
 	}
@@ -337,8 +338,9 @@ func (sv *LeisureContext) docList() {
 // URL: GET /doc/get/DOC_ID
 // Retrieve the latest document contents
 func (sv *LeisureContext) docGet() (any, error) {
-	docId, _ := sv.getDocId(sv.r)
-	if docId == "" {
+	if docId, _, err := sv.getDocId(sv.r); err != nil {
+		return nil, sv.error(ErrCommandFormat, "bad document path encoding: %s", sv.r.URL.Path)
+	} else if docId == "" {
 		return nil, sv.error(ErrCommandFormat, "Expected document ID in url: %s", sv.r.URL)
 	} else if doc := sv.documents[docId]; doc == nil {
 		return nil, sv.error(ErrUnknownDocument, "No document for id: %s", docId)
@@ -360,13 +362,16 @@ func (sv *LeisureContext) docGet() (any, error) {
 }
 
 // get the the document id from the end of the path (or "") and the remaining path
-func (sv *LeisureService) getDocId(r *http.Request) (string, string) {
+func (sv *LeisureService) getDocId(r *http.Request) (string, string, error) {
 	p := r.URL.Path
-	docId := path.Base(p)
-	if sv.documentAliases[docId] != "" {
-		docId = sv.documentAliases[docId]
+	if docId, err := url.PathUnescape(path.Base(p)); err != nil {
+		return "", "", err
+	} else {
+		if sv.documentAliases[docId] != "" {
+			docId = sv.documentAliases[docId]
+		}
+		return docId, path.Dir(p), nil
 	}
-	return docId, path.Dir(p)
 }
 
 // add replacements on the session for changes between the current doc and newDoc
@@ -375,25 +380,44 @@ func addChanges(session *LeisureSession, newDoc string) bool {
 	// check document and add edits to session
 	doc := session.latestBlock().GetDocument(session.History)
 	doc.Apply(session.SessionId, 0, session.PendingOps)
+	repls := getEdits(doc.String(), newDoc)
+	session.ReplaceAll(repls)
+	return len(repls) > 0
+}
+
+func getEdits(oldDoc, newDoc string) []doc.Replacement {
+	repls := make([]doc.Replacement, 0, 8)
 	dmp := diff.New()
 	pos := 0
-	changed := false
-	for _, dif := range dmp.DiffMain(doc.String(), newDoc, true) {
-		switch dif.Type {
-		case diff.DiffDelete:
-			session.Replace(pos, len(dif.Text), "")
-			changed = true
-		case diff.DiffEqual:
-			pos += len(dif.Text)
-		case diff.DiffInsert:
-			session.Replace(pos, 0, dif.Text)
-			changed = true
+	del := 0
+	sb := strings.Builder{}
+	save := func() {
+		if del+sb.Len() > 0 {
+			repls = append(repls, doc.Replacement{Offset: pos, Length: del, Text: sb.String()})
+			pos += del
+			del = 0
+			sb.Reset()
 		}
 	}
-	return changed
+	for _, dif := range dmp.DiffMain(oldDoc, newDoc, true) {
+		switch dif.Type {
+		case diff.DiffDelete:
+			del += len(dif.Text)
+		case diff.DiffEqual:
+			save()
+			pos += len(dif.Text)
+		case diff.DiffInsert:
+			sb.WriteString(dif.Text)
+		}
+	}
+	save()
+	return repls
 }
 
 // URL: GET or POST /session/create/SESSION/DOC
+//
+// -- REFACTOR: THERE'S A LOT OF OVERLAP WITH sessionConnect
+//
 // creates a new session with peer name = sv.id + sv.serial and connects to it.
 // if this was a get request
 //
@@ -405,10 +429,12 @@ func addChanges(session *LeisureSession, newDoc string) bool {
 //
 //	returns whether there are pending changes
 func (sv *LeisureContext) sessionCreate() {
-	docId, p := sv.getDocId(sv.r)
+	docId, p, docIdErr := sv.getDocId(sv.r)
 	_, wantsOrg, wantsStrings, dataMode := sv.getParams()
 	sessionId := path.Base(p)
-	if docId == "" {
+	if docIdErr != nil {
+		sv.writeError(ErrCommandFormat, "bad document path encoding: %s", sv.r.URL.Path)
+	} else if docId == "" {
 		sv.writeError(ErrCommandFormat, "No document ID. Session create requires a session ID and a document ID")
 	} else if sessionId == "" {
 		sv.writeError(ErrCommandFormat, "No session ID. Session create requires a session ID and a document ID")
@@ -421,23 +447,27 @@ func (sv *LeisureContext) sessionCreate() {
 		if sv.r.Method == http.MethodPost {
 			if incoming, err := io.ReadAll(sv.r.Body); err != nil {
 				sv.writeError(ErrCommandFormat, "Could not read document contents")
-			} else {
-				sv.writeResponse(addChanges(session, string(incoming)))
+				return
+			} else if len(getEdits(session.GetLatestDocument().String(), string(incoming))) == 0 {
+				// no changes, return false
+				sv.writeResponse(false)
+				return
 			}
-			return
+			// continue creating session
 		} else if hashStr := sv.r.URL.Query().Get("hash"); hashStr != "" {
 			var hash Sha
 			if count, err := hex.Decode(hash[:], []byte(hashStr)); err != nil || count < len(hash) {
 				sv.writeError(ErrCommandFormat, "Bad hash %s", hashStr)
+				return
 			} else if incoming := doc.GetDocument(hash); incoming == "" {
 				sv.writeError(ErrCommandFormat, "No document for hash %s", hashStr)
-			} else {
-				latest := session.latestBlock()
-				sv.writeResponse(latest.GetDocumentHash(sv.session.History) != hash)
+				return
+			} else if session.Source.GetDocumentHash(sv.session.History) == hash {
+				sv.writeResponse(false)
 			}
-			return
+			// continue creating session
 		}
-		doc := session.latestBlock().GetDocument(session.History).String()
+		doc := session.GetLatestDocument().String()
 		if sv.session.dataMode {
 			sv.session.chunks = org.Parse(doc)
 			data := map[string]any{}
@@ -512,6 +542,9 @@ func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.
 	sv.sessions[session.SessionId] = session
 	sv.session = session
 	session.connect(sv.w)
+	if len(history.Latest) > 0 && history.Latest[session.SessionId] == nil {
+		session.Commit(0, 0)
+	}
 	return session
 }
 
@@ -547,70 +580,78 @@ func (sv *LeisureContext) getParams() (string, bool, bool, bool) {
 //
 // returns whether the body contained changes to the session's document
 func (sv *LeisureContext) sessionConnect() (any, error) {
-	if sessionId, ok := urlTail(sv.r, SESSION_CONNECT); !ok {
+	sessionId, ok := urlTail(sv.r, SESSION_CONNECT)
+	if !ok {
 		return nil, sv.error(ErrCommandFormat, "Bad connect format, should be %sID but was %s", SESSION_CONNECT, sv.r.URL.RequestURI())
-	} else {
-		docId, wantsOrg, wantsStrings, dataMode := sv.getParams()
-		force := strings.ToLower(sv.r.URL.Query().Get("force")) == "true"
-		history := sv.documents[docId]
-		if history == nil && sv.documentAliases[docId] != "" {
-			history = sv.documents[sv.documentAliases[docId]]
-
-		}
-		if session := sv.sessions[sessionId]; session == nil && docId == "" {
-			return nil, sv.error(ErrUnknownSession, "No session %s", sessionId)
-		} else if session != nil && sv.findSession(sv.r) == nil && !force {
-			return nil, sv.error(ErrDuplicateConnection, "There is already a connection for %s", sessionId)
-		} else if sv.r.Method == http.MethodPost {
-			if incoming, err := io.ReadAll(sv.r.Body); err != nil {
-				return nil, sv.error(ErrCommandFormat, "Could not read document contents")
-			} else if session != nil {
-				session.wantsOrg = wantsOrg
-				return addChanges(session, string(incoming)), nil
-			} else if history != nil {
-				session := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
-				return addChanges(session, string(incoming)), nil
-			} else {
-				alias := ""
-				uuid, err := gouuid.ParseHex(docId)
-				if err != nil {
-					// unparseable doc ID means it's an alias, so create an ID
-					if uuid, err = gouuid.NewV4(); err != nil {
-						return false, sv.error(ErrInternalError, "could not generate uuid: %s", err)
-					}
-					alias = docId
-					docId = uuid.String()
-				}
-				sv.addDoc(docId, alias, string(incoming))
-				sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
-				return true, nil
-			}
-		} else if session != nil {
-			session.lastUsed = time.Now()
-			session.wantsOrg = wantsOrg
-		} else if history == nil {
-			return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
-		} else {
-			sv.session = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode)
-		}
-		content := sv.session.latestBlock().GetDocument(sv.session.History).String()
-		result := any(content)
-		if sv.session.dataMode {
-			sv.session.chunks = org.Parse(content)
-			data := map[string]any{}
-			sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
-				if src, ok := ch.(*org.SourceBlock); ok && src.IsNamedData() {
-					data[src.Name()] = src.Value
-				}
-				return true
-			})
-			result = data
-		} else if sv.session.wantsOrg {
-			sv.session.chunks = org.Parse(content)
-			result = jmap("document", result, "chunks", sv.session.chunks)
-		}
-		return result, nil
 	}
+	docId, wantsOrg, wantsStrings, dataMode := sv.getParams()
+	force := strings.ToLower(sv.r.URL.Query().Get("force")) == "true"
+	history := sv.documents[docId]
+	if history == nil && sv.documentAliases[docId] != "" {
+		history = sv.documents[sv.documentAliases[docId]]
+	}
+	session := sv.sessions[sessionId]
+	if session != nil {
+		session.lastUsed = time.Now()
+		session.wantsOrg = wantsOrg
+	}
+	if session == nil && docId == "" {
+		return nil, sv.error(ErrUnknownSession, "No session %s", sessionId)
+	} else if session != nil && sv.findSession(sv.r) == nil && !force {
+		return nil, sv.error(ErrDuplicateConnection, "There is already a connection for %s", sessionId)
+	} else if sv.r.Method == http.MethodPost {
+		if incoming, err := io.ReadAll(sv.r.Body); err != nil {
+			return nil, sv.error(ErrCommandFormat, "Could not read document contents")
+		} else if session != nil {
+			// document may have changed since last connect
+			return addChanges(session, string(incoming)), nil
+		} else if history != nil {
+			// this is a new session and the document already exists
+			if len(getEdits(history.GetLatestDocument().String(), string(incoming))) == 0 {
+				sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
+				return false, nil
+			}
+			// continue with connection
+		} else {
+			// this is a new document
+			alias := ""
+			uuid, err := gouuid.ParseHex(docId)
+			if err != nil {
+				// unparseable doc ID means it's an alias, so create an ID
+				if uuid, err = gouuid.NewV4(); err != nil {
+					return false, sv.error(ErrInternalError, "could not generate uuid: %s", err)
+				}
+				alias = docId
+				docId = uuid.String()
+			}
+			sv.addDoc(docId, alias, string(incoming))
+			sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
+			return true, nil
+		}
+	}
+	if session == nil {
+		if history == nil {
+			return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
+		}
+		sv.session = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode)
+	}
+	content := sv.session.GetLatestDocument().String()
+	result := any(content)
+	if sv.session.dataMode {
+		sv.session.chunks = org.Parse(content)
+		data := map[string]any{}
+		sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
+			if src, ok := ch.(*org.SourceBlock); ok && src.IsNamedData() {
+				data[src.Name()] = src.Value
+			}
+			return true
+		})
+		result = data
+	} else if sv.session.wantsOrg {
+		sv.session.chunks = org.Parse(content)
+		result = jmap("document", result, "chunks", sv.session.chunks)
+	}
+	return result, nil
 }
 
 func (sv *LeisureContext) orgParse() (any, error) {
@@ -870,9 +911,9 @@ func asError(err any) error {
 }
 
 func (session *LeisureSession) latestBlock() *hist.OpBlock {
-	blk := session.History.Latest[session.SessionId]
+	blk := session.Latest[session.SessionId]
 	if blk == nil {
-		blk = session.History.Source
+		blk = session.Source
 	}
 	return blk
 }
