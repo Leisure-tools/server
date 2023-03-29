@@ -175,6 +175,40 @@ type testServer struct {
 	history    *history.History
 }
 
+type testSession struct {
+	myT
+	*testServer
+	sessionId string
+	cookie    *http.Cookie
+	*history.History
+}
+
+func (sv *testServer) newSession(name, doc, expected string) *testSession {
+	s := &testSession{
+		myT:        sv.t,
+		testServer: sv,
+		sessionId:  name,
+	}
+	cookies, body := sv.processGet(SESSION_CREATE, name, doc)
+	s.myT.testEqual(body, expected, "bad response for create")
+	s.cookie = cookies[0]
+	s.History = sv.service.sessions[name].History
+	return s
+}
+
+func (s *testSession) edit(edit map[string]any, expected map[string]any, msg string) {
+	s.testPost(s.testServer.jsonDecode, SESSION_EDIT, s.cookie, s.sessionId,
+		s.jsonEncode(edit),
+		expected,
+		msg)
+}
+
+func (s *testSession) testGet(args ...any) {
+	a := append(make([]any, 0, len(args)+1), args[0], s.cookie)
+	a = append(a, args[1:])
+	s.testServer.testGet(args...)
+}
+
 func (sv *testServer) Error(args ...any) {
 	sv.t.Error(args...)
 }
@@ -627,4 +661,26 @@ frood
 		"bad edit result",
 	)
 	sv.shutdown()
+}
+
+func TestTwoSessions(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
+	sv.post(DOC_CREATE, "0000", "?", "alias", "bubba", "hello there")
+	emacs := sv.newSession("emacs", "bubba", "hello there")
+	browser := sv.newSession("browser", "bubba", "hello there")
+	emacs.edit(t.edit(0, 0, 0, 5, "goodbye"), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 0, 5, "goodbye"), "bad edit response")
+	emacs.edit(t.edit(0, 0, 8, 1, ""), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 8, 1, ""), "bad edit response")
+	t.testEqual(emacs.GetLatestDocument().String(), "goodbye here", "bad latest document")
+	emacs.edit(t.edit(0, 0, 8, 0, "t"), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 8, 0, "t"), "bad edit response")
+	emacs.edit(t.edit(0, 0, 8, 0, "asdf"), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 8, 0, "asdf"), "bad edit response")
+	emacs.edit(t.edit(0, 0, 12, 0, "qwer"), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 12, 0, "qwer"), "bad edit response")
+	emacs.edit(t.edit(0, 0, 16, 0, "zxcv"), t.edit(0, 0), "bad edit response")
+	emacs.edit(t.edit(0, 0, 20, 0, "uiop"), t.edit(0, 0), "bad edit response")
+	browser.edit(t.edit(0, 0), t.edit(0, 0, 16, 0, "zxcvuiop"), "bad edit response")
 }

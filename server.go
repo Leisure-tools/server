@@ -787,9 +787,12 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 			}
 			repl = append(repl, curRepl)
 		}
-		// Validate by using Apply, which panics on a repl problem, causing the defer to return an erorr
+		// Using Apply validates the edits, panicking on a repl problem, causing the defer to return an erorr
 		blk := sv.session.latestBlock()
-		blk.GetDocument(sv.session.History).Apply(sv.session.SessionId, 0, repl)
+		d := blk.GetDocument(sv.session.History).Freeze()
+		d.Apply(sv.session.SessionId, 0, repl)
+		d.Simplify()
+		repl = append(repl[:0], d.Edits()...)
 		// done validating inputs
 		sv.verbose("edit: %v", repl)
 		sv.session.ReplaceAll(repl)
@@ -889,7 +892,7 @@ func (sv *LeisureContext) chunkSlice(chunks *org.OrgChunks, ids doc.Set[org.OrgI
 func hasNewData(h *hist.History, parents []Sha) bool {
 	//return !hist.SameHashes(h.LatestHashes(), parents)
 	latest := h.LatestHashes()
-	if !hist.SameHashes(latest, parents) {
+	if !hist.SameHashes(latest, parents, Sha{}) {
 		// check for nontrivial descendants
 		h.GetBlockOrder()
 		for _, parentHash := range parents {
