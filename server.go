@@ -36,6 +36,12 @@ type LeisureError struct {
 	wrapped error
 }
 
+type NamedBlock struct {
+	Language string
+	Params   string
+	Content  string
+}
+
 func NewLeisureError(errorType string, values ...any) LeisureError {
 	e := LeisureError{Type: errorType}
 	if len(values) > 1 {
@@ -121,6 +127,7 @@ const (
 	SESSION_SET      = VERSION + "/session/set/"
 	SESSION_REMOVE   = VERSION + "/session/remove/"
 	ORG_PARSE        = VERSION + "/org/parse"
+	STOP             = VERSION + "/stop"
 )
 
 func (err LeisureError) Error() string {
@@ -414,6 +421,44 @@ func getEdits(oldDoc, newDoc string) []doc.Replacement {
 	return repls
 }
 
+func (sv *LeisureContext) extractData() (data, blocks, tables map[string]any) {
+	data = map[string]any{}
+	blocks = map[string]any{}
+	tables = map[string]any{}
+	sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
+		name, dt, blk, tbl := extractData(ch)
+		if dt != nil {
+			data[name] = dt
+		} else if blk != nil {
+			blocks[name] = blk
+		} else if tbl != nil {
+			tables[name] = tbl
+		}
+		return true
+	})
+	return
+}
+
+// return name, data, block, table
+// only one of data, block, and table can be non-nil
+func extractData(ch interface{}) (string, interface{}, *NamedBlock, interface{}) {
+	if src, ok := ch.(*org.SourceBlock); ok {
+		name := src.Name()
+		if src.IsNamedData() {
+			return name, src.Value, nil, nil
+		} else if name != "" {
+			return name, nil, &NamedBlock{
+				Language: src.LabelText(),
+				Params:   src.Text[src.LabelEnd+1 : src.Content-1],
+				Content:  src.Text[src.Content:src.End],
+			}, nil
+		}
+	} else if tbl, ok := ch.(*org.TableBlock); ok {
+		return tbl.Name(), nil, nil, tbl.Value
+	}
+	return "", nil, nil, nil
+}
+
 // URL: GET or POST /session/create/SESSION/DOC
 //
 // -- REFACTOR: THERE'S A LOT OF OVERLAP WITH sessionConnect
@@ -468,17 +513,12 @@ func (sv *LeisureContext) sessionCreate() {
 			// continue creating session
 		}
 		doc := session.GetLatestDocument().String()
+		fmt.Println("Datamode: ", sv.session.dataMode)
 		if sv.session.dataMode {
 			sv.session.chunks = org.Parse(doc)
-			data := map[string]any{}
-			sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
-				if src, ok := ch.(*org.SourceBlock); ok && src.IsNamedData() && src.NameStart != -1 {
-					data[src.Name()] = src.Value
-				}
-				return true
-			})
+			data, blocks, tables := sv.extractData()
 			sv.jsonResponse(func() (any, error) {
-				return data, nil
+				return map[string]any{"data": data, "blocks": blocks, "tables": tables}, nil
 			})
 		} else if session.wantsOrg {
 			content := doc
@@ -639,14 +679,8 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 	result := any(content)
 	if sv.session.dataMode {
 		sv.session.chunks = org.Parse(content)
-		data := map[string]any{}
-		sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
-			if src, ok := ch.(*org.SourceBlock); ok && src.IsNamedData() {
-				data[src.Name()] = src.Value
-			}
-			return true
-		})
-		result = data
+		data, blocks, tables := sv.extractData()
+		result = map[string]any{"data": data, "blocks": blocks, "tables": tables}
 	} else if sv.session.wantsOrg {
 		sv.session.chunks = org.Parse(content)
 		result = jmap("document", result, "chunks", sv.session.chunks)
@@ -660,6 +694,10 @@ func (sv *LeisureContext) orgParse() (any, error) {
 	} else {
 		return org.Parse(string(incoming)), nil
 	}
+}
+
+func (sv *LeisureContext) stop() {
+	os.Exit(0)
 }
 
 func (sv *LeisureContext) selectedChunks(edits []doc.Replacement) []org.Chunk {
@@ -723,12 +761,12 @@ func (sv *LeisureContext) error(errObj any, format string, args ...any) error {
 	args = append(append(make([]any, 0, len(args)+1), lerr), args...)
 	err := fmt.Errorf("%w:"+format, args...)
 	if sv.session != nil {
-		fmt.Fprintf(os.Stderr, "Session error for %s: %s\n%s", sv.session.SessionId, err.Error(), debug.Stack())
+		fmt.Fprintf(os.Stderr, "Session error for (%v) %s: %s\n%s", sv.r, sv.session.SessionId, err.Error(), debug.Stack())
 		debug.PrintStack()
 		sv.logger.Output(2, fmt.Sprintf("Connection %s got error: %s", sv.session.SessionId, err))
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Session error [no session]: %s\n%s", err.Error(), debug.Stack())
+	fmt.Fprintf(os.Stderr, "Session error (%v) [no session]: %s\n%s", sv.r, err.Error(), debug.Stack())
 	debug.PrintStack()
 	sv.logger.Output(2, fmt.Sprintf("got error: %s", err))
 	return err
@@ -979,6 +1017,7 @@ func (sv *LeisureContext) sessionUpdate() {
 
 // URL: GET /session/get/NAME
 // get data for NAME
+// only allowed for datamode
 func (sv *LeisureContext) sessionGet() (result any, err error) {
 	// set err if there's a panic
 	defer func() {
@@ -988,19 +1027,23 @@ func (sv *LeisureContext) sessionGet() (result any, err error) {
 	}()
 	if err := sv.checkSession(); err != nil {
 		return nil, sv.error(err, "")
+	} else if !sv.session.dataMode && !sv.session.wantsOrg {
+		return nil, sv.error(ErrCommandFormat, "Not in datamode or orgmode")
 	} else if name := path.Base(sv.r.URL.Path); name == "" {
 		return nil, sv.error(ErrCommandFormat, "Bad get command, no name")
 	} else if data := sv.session.chunks.GetChunkNamed(name); data.Chunks.IsEmpty() {
 		return nil, sv.error(ErrDataMissing, "No data named %s", name)
-	} else if src, ok := data.Chunk.(*org.SourceBlock); ok {
-		if src.IsData() {
-			return src.Value, nil
+	} else {
+		name, dt, blk, tbl := extractData(data.Chunk)
+		if dt != nil {
+			return map[string]any{"type": "data", "value": dt}, nil
+		} else if blk != nil {
+			return map[string]any{"type": "block", "value": blk}, nil
+		} else if tbl != nil {
+			return map[string]any{"type": "table", "value": tbl}, nil
 		}
 		return nil, sv.error(ErrDataMismatch, "%s is not a data block", name)
-	} else if tbl, ok := data.Chunk.(*org.TableBlock); ok {
-		return tbl.Value, nil
 	}
-	return nil, sv.error(ErrUnknown, "Unknown error")
 }
 
 // URL: POST /session/set/NAME
@@ -1061,7 +1104,24 @@ func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, valu
 	} else {
 		sv.verbose("NEW DATA:", newText)
 		end += len(newText) - len(ch.AsOrgChunk().Text)
-		return sv.replaceText(-1, -1, offset+start, end-start, newText[start:end])
+		sv.verbose("WANTS ORG:", sv.session.wantsOrg)
+		result, err := sv.replaceText(-1, -1, offset+start, end-start, newText[start:end])
+		fmt.Println("WANTS ORG: ", sv.session.wantsOrg)
+		if err == nil && sv.session.wantsOrg {
+			fmt.Println("RETURNING JSON")
+			obj := jmap("replacements", result, "chunk", sv.session.chunks.GetChunkAt(offset+start))
+			if data, err := json.Marshal(obj); err != nil {
+				sv.verboseN(1, "Writing error %s", err)
+				if sv.verbosity > 0 {
+					debug.PrintStack()
+				}
+				fmt.Println("RETURNING JSON: ", data)
+				return data, nil
+			} else {
+				return nil, err
+			}
+		}
+		return result, err
 	}
 }
 
@@ -1117,7 +1177,7 @@ func (sv *LeisureContext) jsonSvc(fn func(jsonObj) (any, error)) {
 			var msg any
 			if len(body) > 0 {
 				if err := json.Unmarshal(body, &msg); err != nil {
-					return nil, sv.error(ErrCommandFormat, "expected a json body but got %v", body)
+					return nil, sv.error(ErrCommandFormat, "expected a json body but got %v", string(body))
 				}
 			}
 			return fn(jsonV(msg))
@@ -1228,6 +1288,7 @@ func Initialize(id string, mux *http.ServeMux, storageFactory func(string, strin
 	sv.handleJsonResponse(mux, SESSION_GET, (*LeisureContext).sessionGet)
 	sv.handleJson(mux, SESSION_SET, (*LeisureContext).sessionSet)
 	sv.handleJsonResponse(mux, ORG_PARSE, (*LeisureContext).orgParse)
+	sv.handle(mux, STOP, (*LeisureContext).stop)
 	runSvc(sv.service)
 	return sv
 }

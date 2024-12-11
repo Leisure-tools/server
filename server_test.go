@@ -142,6 +142,19 @@ func (j jsonObj) equals(obj jsonObj) bool {
 	return false
 }
 
+// return whether j and obj are both objects and j is a subset of obj
+func (j jsonObj) subsetOf(obj jsonObj) bool {
+	if j.typeof() != "object" || obj.typeof() != "object" {
+		return false
+	}
+	for _, key := range j.keys() {
+		if !j.getJson(key).equals(obj.getJson(key)) {
+			return false
+		}
+	}
+	return true
+}
+
 func (t myT) jsonV(value any) jsonObj {
 	var result any
 	t.failNowIfErr(json.Unmarshal([]byte(r1(json.Marshal(value)).check(t)), &result))
@@ -151,6 +164,13 @@ func (t myT) jsonV(value any) jsonObj {
 func (t myT) testEqual(actual any, expected any, msg any) {
 	//if !t.jsonV(actual).equals(t.jsonV(expected)) {
 	if !jsonV(actual).equals(jsonV(expected)) {
+		die(t, fmt.Sprintf("%s: expected\n <%v> but got\n <%v>", msg, expected, actual))
+	}
+}
+
+func (t myT) testSubset(actual any, expected any, msg any) {
+	//if !t.jsonV(actual).equals(t.jsonV(expected)) {
+	if !jsonV(expected).subsetOf(jsonV(actual)) {
 		die(t, fmt.Sprintf("%s: expected\n <%v> but got\n <%v>", msg, expected, actual))
 	}
 }
@@ -474,10 +494,6 @@ func (t myT) repls(args ...any) []doc.Replacement {
 }
 
 func (t myT) edit(selOff, selLen int, repls ...any) map[string]any {
-	//fmt.Fprintf(os.Stderr, "Replacements: %v\n", t.jsonEncode(jmap(
-	//	"selectionOffset", selOff,
-	//	"selectionLength", selLen,
-	//	"replacements", t.repls(repls...))))
 	return jmap(
 		"selectionOffset", selOff,
 		"selectionLength", selLen,
@@ -638,9 +654,9 @@ frood
 	emacs := cookies[0]
 	cookies, _ = sv.processGet(SESSION_CREATE, "vscode", "bubba", "?", "org", "true")
 	vscode := cookies[0]
-	sv.testPost(sv.jsonDecode, SESSION_EDIT, emacs, sv.t.jsonEncode(
-		sv.t.edit(0, 0, 12, 6, "julia")),
-		sv.t.edit(0, 0),
+	sv.testPost(sv.jsonDecode, SESSION_EDIT, emacs,
+		t.jsonEncode(t.edit(0, 0, 12, 6, "julia")),
+		t.edit(0, 0),
 		"bad edit result",
 	)
 	expected := sv.t.edit(0, 0, 12, 6, "julia")
@@ -650,6 +666,10 @@ frood
 		"id", "chunk-1",
 		"label", 12,
 		"labelEnd", 17,
+		"nameStart", 0,
+		"nameEnd", 0,
+		"srcStart", 0,
+		"options", nil,
 		"text", doc[:12]+"julia"+doc[18:],
 		"type", "source",
 	)
