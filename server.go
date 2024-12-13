@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -421,42 +422,31 @@ func getEdits(oldDoc, newDoc string) []doc.Replacement {
 	return repls
 }
 
-func (sv *LeisureContext) extractData() (data, blocks, tables map[string]any) {
-	data = map[string]any{}
-	blocks = map[string]any{}
-	tables = map[string]any{}
+func (sv *LeisureContext) extractData() map[string]any {
+	data := map[string]any{}
 	sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
-		name, dt, blk, tbl := extractData(ch)
-		if dt != nil {
+		name, dt := extractData(ch, sv.session.wantsOrg)
+		if name != "" {
 			data[name] = dt
-		} else if blk != nil {
-			blocks[name] = blk
-		} else if tbl != nil {
-			tables[name] = tbl
 		}
 		return true
 	})
-	return
+	return data
 }
 
 // return name, data, block, table
 // only one of data, block, and table can be non-nil
-func extractData(ch interface{}) (string, interface{}, *NamedBlock, interface{}) {
-	if src, ok := ch.(*org.SourceBlock); ok {
-		name := src.Name()
-		if src.IsNamedData() {
-			return name, src.Value, nil, nil
-		} else if name != "" {
-			return name, nil, &NamedBlock{
-				Language: src.LabelText(),
-				Params:   src.Text[src.LabelEnd+1 : src.Content-1],
-				Content:  src.Text[src.Content:src.End],
-			}, nil
+func extractData(ch interface{}, withOrg bool) (string, any) {
+	if blk, ok := ch.(org.DataBlock); ok {
+		name := blk.Name()
+		if name != "" {
+			if withOrg {
+				return name, blk
+			}
+			return name, blk.GetValue()
 		}
-	} else if tbl, ok := ch.(*org.TableBlock); ok {
-		return tbl.Name(), nil, nil, tbl.Value
 	}
-	return "", nil, nil, nil
+	return "", nil
 }
 
 // URL: GET or POST /session/create/SESSION/DOC
@@ -516,9 +506,9 @@ func (sv *LeisureContext) sessionCreate() {
 		fmt.Println("Datamode: ", sv.session.dataMode)
 		if sv.session.dataMode {
 			sv.session.chunks = org.Parse(doc)
-			data, blocks, tables := sv.extractData()
+			data := sv.extractData()
 			sv.jsonResponse(func() (any, error) {
-				return map[string]any{"data": data, "blocks": blocks, "tables": tables}, nil
+				return data, nil
 			})
 		} else if session.wantsOrg {
 			content := doc
@@ -679,8 +669,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 	result := any(content)
 	if sv.session.dataMode {
 		sv.session.chunks = org.Parse(content)
-		data, blocks, tables := sv.extractData()
-		result = map[string]any{"data": data, "blocks": blocks, "tables": tables}
+		result = sv.extractData()
 	} else if sv.session.wantsOrg {
 		sv.session.chunks = org.Parse(content)
 		result = jmap("document", result, "chunks", sv.session.chunks)
@@ -756,13 +745,17 @@ func (sv *LeisureContext) checkSession() error {
 	return nil
 }
 
+func getstack() []byte {
+	r, _ := regexp.Compile("^([^\n]*\n){7}")
+	return r.ReplaceAll(debug.Stack(), []byte{})
+}
+
 func (sv *LeisureContext) error(errObj any, format string, args ...any) error {
 	lerr := asLeisureError(errObj)
 	args = append(append(make([]any, 0, len(args)+1), lerr), args...)
 	err := fmt.Errorf("%w:"+format, args...)
 	if sv.session != nil {
-		fmt.Fprintf(os.Stderr, "Session error for (%v) %s: %s\n%s", sv.r, sv.session.SessionId, err.Error(), debug.Stack())
-		debug.PrintStack()
+		fmt.Fprintf(os.Stderr, "Session error for (%v) %s: %s\n%s", sv.r, sv.session.SessionId, err.Error(), getstack())
 		sv.logger.Output(2, fmt.Sprintf("Connection %s got error: %s", sv.session.SessionId, err))
 		return err
 	}
@@ -880,7 +873,7 @@ func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replace
 		if changeCount == 0 || (changeCount == linkCount && sv.session.dataMode) {
 			return nil
 		} else if sv.session.dataMode {
-			return changes.DataChanges(chunks)
+			return changes.DataChanges(chunks, sv.session.wantsOrg)
 		} else if changeCount > 0 {
 			result["order"] = changes.Order(chunks)
 			if !changes.Changed.IsEmpty() {
@@ -1034,13 +1027,9 @@ func (sv *LeisureContext) sessionGet() (result any, err error) {
 	} else if data := sv.session.chunks.GetChunkNamed(name); data.Chunks.IsEmpty() {
 		return nil, sv.error(ErrDataMissing, "No data named %s", name)
 	} else {
-		name, dt, blk, tbl := extractData(data.Chunk)
-		if dt != nil {
-			return map[string]any{"type": "data", "value": dt}, nil
-		} else if blk != nil {
-			return map[string]any{"type": "block", "value": blk}, nil
-		} else if tbl != nil {
-			return map[string]any{"type": "table", "value": tbl}, nil
+		name, dt := extractData(data.Chunk, sv.session.wantsOrg)
+		if name != "" {
+			return dt, nil
 		}
 		return nil, sv.error(ErrDataMismatch, "%s is not a data block", name)
 	}
