@@ -14,6 +14,7 @@ import (
 
 	doc "github.com/leisure-tools/document"
 	"github.com/leisure-tools/history"
+	"github.com/leisure-tools/org"
 )
 
 type MockResponseWriter struct {
@@ -301,6 +302,7 @@ func (sv *testServer) get(url ...any) (*http.Request, *MockResponseWriter) {
 func (sv *testServer) post(url ...any) (*http.Request, *MockResponseWriter) {
 	body := url[len(url)-1]
 	url = url[:len(url)-1]
+	//fmt.Fprintln(os.Stderr, "URL: ", urlFor(url))
 	req, resp := sv.route(sv.mux, http.MethodPost, urlFor(url), cookieFor(url), fmt.Sprint(body))
 	sv.t.testEqual(resp.status, http.StatusOK, lazy(func() string {
 		return fmt.Sprintf("Unsuccessful request: %s", resp.buf.String())
@@ -516,9 +518,9 @@ func TestTwoPeers(tt *testing.T) {
 	sv.testGet(SESSION_DOCUMENT, vscode, "hello goodbye", "Unexpected document")
 	sv.testGet(sv.jsonDecode, SESSION_UPDATE, emacs, true, "Expected update")
 	sv.testGet(SESSION_DOCUMENT, emacs, "hello there", "Unexpected document")
-	session := sv.service.sessions["emacs"]
-	fmt.Printf("EMACS: %v\n", session.SessionId)
-	fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.SessionId])
+	//session := sv.service.sessions["emacs"]
+	//fmt.Printf("EMACS: %v\n", session.SessionId)
+	//fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.SessionId])
 	jrepl := jsonV(&doc.Replacement{Offset: 1, Length: 2, Text: "three"})
 	expectedRepl := jmap("offset", 1, "length", 2, "text", "three")
 	t.testEqual(expectedRepl, jrepl, "Bad comparison")
@@ -611,7 +613,7 @@ func (sv *testServer) printBlock(blk *history.OpBlock) {
 }
 
 func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offset, length int, text string) {
-	fmt.Printf("replace %d %d %s\n", offset, length, text)
+	//fmt.Printf("replace %d %d %s\n", offset, length, text)
 	h := sv.service.sessions[s1].History
 	doc1 := sv.latest(s1).GetDocument(h)
 	doc2 := sv.latest(s2).GetDocument(h)
@@ -622,8 +624,8 @@ func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offse
 		"bad edit result",
 	)
 	sv.addBlock(sv.latest(s1))
-	sv.printBlock(sv.latest(s1))
-	sv.printBlockOrder()
+	//sv.printBlock(sv.latest(s1))
+	//sv.printBlockOrder()
 	newDoc1 := sv.service.sessions[s1].latestBlock().GetDocument(h)
 	sv.t.failNowIfNot(doc1.String() != newDoc1.String(), "document is unchanged")
 	sv.t.failNowIfNot(len(doc1.String())+len(text) == len(newDoc1.String()), "new document size is wrong")
@@ -632,8 +634,8 @@ func (sv *testServer) change(s1, s2 string, cookie1, cookie2 *http.Cookie, offse
 		"bad edit result",
 	)
 	sv.addBlock(sv.latest(s2))
-	sv.printBlock(sv.latest(s2))
-	sv.printBlockOrder()
+	//sv.printBlock(sv.latest(s2))
+	//sv.printBlockOrder()
 	newDoc2 := sv.service.sessions[s2].latestBlock().GetDocument(h)
 	sv.t.failNowIfNot(doc2.String() != newDoc2.String(), "document is unchanged")
 	sv.t.failNowIfNot(len(doc2.String())+len(text) == len(newDoc2.String()), "new document size is wrong")
@@ -681,6 +683,93 @@ frood
 		"bad edit result",
 	)
 	sv.shutdown()
+}
+
+func TestMultiset(tt *testing.T) {
+	t := myT{tt}
+	sv := t.createServer("test")
+	doc0 := `
+#+NAME: one
+#+begin_src yaml
+a: 1
+#+end_src
+#+NAME: two
+#+begin_src yaml
+b: 2
+#+end_src
+#+NAME: three
+#+begin_src yaml
+c: 3
+#+end_src
+`
+	doc1 := `
+#+NAME: one
+#+begin_src yaml
+4
+#+end_src
+#+NAME: two
+#+begin_src yaml
+b: 2
+#+end_src
+#+NAME: three
+#+begin_src yaml
+c: 3
+#+end_src
+`
+	doc2 := `
+#+NAME: one
+#+begin_src yaml
+4
+#+end_src
+#+NAME: two
+#+begin_src yaml
+5
+#+end_src
+#+NAME: three
+#+begin_src yaml
+c: 3
+#+end_src
+`
+	doc3 := `
+#+NAME: one
+#+begin_src yaml
+4
+#+end_src
+#+NAME: two
+#+begin_src yaml
+5
+#+end_src
+#+NAME: three
+#+begin_src yaml
+6
+#+end_src
+`
+	sv.post(DOC_CREATE, "0000", "?", "alias", "bubba", doc0)
+	sv.history = sv.service.documents["0000"]
+	sv.addBlock(sv.history.Source)
+	//org.SetVerbosity(1)
+	//sv.service.verbosity = 1
+	cookies, _ := sv.processGet(SESSION_CREATE, "emacs", "bubba", "?", "org", "true", "dataOnly", "true")
+	emacs := cookies[0]
+	_, doc := sv.processGet(SESSION_DOCUMENT, emacs)
+	t.testEqual(doc, doc0, "Bad document")
+	sv.testSet("emacs", emacs, "one", 4, doc1)
+	sv.testSet("emacs", emacs, "two", 5, doc2)
+	sv.testSet("emacs", emacs, "three", 6, doc3)
+}
+
+func (sv *testServer) testSet(sess string, cookies *http.Cookie, name string, value any, expected string) {
+	_, resp := sv.post(SESSION_SET, name, cookies, sv.t.jsonEncode(value))
+	sv.t.testEqual(resp.status, http.StatusOK, fmt.Sprintf("Bad response %d", resp.status))
+	s := sv.service.sessions[sess]
+	sb := &strings.Builder{}
+	s.chunks.Chunks.Each(func(chunk org.Chunk) bool {
+		sb.WriteString(chunk.AsOrgChunk().Text)
+		return true
+	})
+	sv.t.testEqual(sb.String(), expected, "Bad setting")
+	doc := s.latestBlock().GetDocument(s.History).String()
+	sv.t.testEqual(doc, expected, "Bad setting")
 }
 
 func TestTwoSessions(tt *testing.T) {

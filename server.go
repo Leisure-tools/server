@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"path"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -95,19 +97,27 @@ type LeisureContext struct {
 
 type LeisureSession struct {
 	*history.History
-	Peer         string
-	SessionId    string
-	PendingOps   []doc.Replacement
-	Follow       string // track a sessionId when making new commits
-	key          *http.Cookie
-	service      *LeisureService
-	hasUpdate    bool
-	updates      chan bool
-	lastUsed     time.Time
-	wantsOrg     bool
-	wantsStrings bool
-	dataMode     bool
-	chunks       *org.OrgChunks
+	Peer          string
+	SessionId     string
+	PendingOps    []doc.Replacement
+	Follow        string // track a sessionId when making new commits
+	key           *http.Cookie
+	service       *LeisureService
+	hasUpdate     bool
+	updates       chan bool
+	lastUsed      time.Time
+	wantsOrg      bool
+	wantsStrings  bool
+	dataMode      bool
+	chunks        *org.OrgChunks
+	updateTimeout time.Duration
+}
+
+type DataChange struct {
+	name     string
+	value    jsonObj
+	data     org.ChunkRef
+	location int
 }
 
 var emptyConnection LeisureSession
@@ -182,6 +192,12 @@ func jsonFor(data []byte) (any, error) {
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *LeisureSession) Commit(selOff int, selLen int) ([]doc.Replacement, int, int) {
 	ops := s.PendingOps
+	if s.wantsOrg {
+		// this will be more efficient that reparsing the entire document
+		for _, op := range s.PendingOps {
+			s.chunks.Replace(op.Offset, op.Length, op.Text)
+		}
+	}
 	s.PendingOps = s.PendingOps[:0]
 	return s.History.Commit(s.Peer, s.SessionId, ops, selOff, selLen)
 }
@@ -202,7 +218,7 @@ func (session *LeisureSession) expired() bool {
 	return time.Now().Sub(session.lastUsed) > time.Duration(session.key.MaxAge*int(time.Second))
 }
 
-func (session *LeisureSession) connect(w http.ResponseWriter) {
+func (session *LeisureSession) connect(_ http.ResponseWriter) {
 	key := make([]byte, 16)
 	rand.Read(key)
 	keyStr := hex.EncodeToString(key)
@@ -248,7 +264,7 @@ func ErrorJSONBytes(err any) []byte {
 }
 
 func (sv *LeisureContext) writeRawError(err error) {
-	sv.verboseN(1, "Writing error %s", err)
+	sv.verboseN(1, "Writing error %s\nrequest: %v", err, sv.r)
 	if sv.verbosity > 0 {
 		debug.PrintStack()
 	}
@@ -363,10 +379,32 @@ func (sv *LeisureContext) docGet() (any, error) {
 		if result == "" {
 			return nil, sv.error(ErrUnknownDocument, "No document for hash: %s", hashCode)
 		}
-		return result, nil
+		return sv.documentResult(result)
 	} else {
-		return doc.GetLatestDocument().String(), nil
+		return sv.documentResult(doc.GetLatestDocument().String())
 	}
+}
+
+func (sv *LeisureContext) documentResult(doc string) (string, error) {
+	if dump := sv.r.URL.Query().Get("dump"); dump != "" {
+		parsed := org.Parse(doc)
+		buf := &bytes.Buffer{}
+		fmt.Fprintln(buf, "CHUNKS:")
+		org.DumpChunks(buf, "", parsed.Chunks)
+		fmt.Fprintln(buf, "\nTREE:")
+		parsed.Chunks.Dump(buf, 0)
+		return buf.String(), nil
+	} else if wantOrg := sv.r.URL.Query().Get("org"); wantOrg != "" {
+		obj := jmap("document", doc, "chunks", org.Parse(doc))
+		if result, err := json.Marshal(obj); err != nil {
+			return "", err
+		} else {
+			buf := &bytes.Buffer{}
+			buf.Write(result)
+			return buf.String(), nil
+		}
+	}
+	return doc, nil
 }
 
 // get the the document id from the end of the path (or "") and the remaining path
@@ -465,9 +503,11 @@ func extractData(ch interface{}, withOrg bool) (string, any) {
 //	returns whether there are pending changes
 func (sv *LeisureContext) sessionCreate() {
 	docId, p, docIdErr := sv.getDocId(sv.r)
-	_, wantsOrg, wantsStrings, dataMode := sv.getParams()
+	_, wantsOrg, wantsStrings, dataMode, updateTimeout, badTimeout := sv.getParams()
 	sessionId := path.Base(p)
-	if docIdErr != nil {
+	if badTimeout != "" {
+		sv.writeError(ErrCommandFormat, "bad timtout paramater: %s", badTimeout)
+	} else if docIdErr != nil {
 		sv.writeError(ErrCommandFormat, "bad document path encoding: %s", sv.r.URL.Path)
 	} else if docId == "" {
 		sv.writeError(ErrCommandFormat, "No document ID. Session create requires a session ID and a document ID")
@@ -478,7 +518,7 @@ func (sv *LeisureContext) sessionCreate() {
 	} else if sv.sessions[sessionId] != nil {
 		sv.writeError(ErrDuplicateSession, "There is already a session named %s", sessionId)
 	} else {
-		session := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
+		session := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, updateTimeout)
 		if sv.r.Method == http.MethodPost {
 			if incoming, err := io.ReadAll(sv.r.Body); err != nil {
 				sv.writeError(ErrCommandFormat, "Could not read document contents")
@@ -500,10 +540,10 @@ func (sv *LeisureContext) sessionCreate() {
 			} else if session.Source.GetDocumentHash(sv.session.History) == hash {
 				sv.writeResponse(false)
 			}
-			// continue creating session
+			// otherwise continue creating session
 		}
 		doc := session.GetLatestDocument().String()
-		fmt.Println("Datamode: ", sv.session.dataMode)
+		//fmt.Println("Datamode: ", sv.session.dataMode)
 		if sv.session.dataMode {
 			sv.session.chunks = org.Parse(doc)
 			data := sv.extractData()
@@ -543,31 +583,41 @@ func (sv *LeisureService) removeStaleSessions(d time.Duration) {
 	}
 }
 
-func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStrings, dataOnly bool) *LeisureSession {
+func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) *LeisureSession {
 	history := sv.documents[docId]
 	if history == nil && sv.documentAliases[docId] != "" {
 		history = sv.documents[sv.documentAliases[docId]]
 	}
-	return sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataOnly)
+	return sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataOnly, updateTimeout)
 }
 
-func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool) *LeisureSession {
+func (s *LeisureSession) hashNums() map[Sha]int {
+	hashes := make(map[Sha]int)
+	order := s.GetBlockOrder()
+	for i, v := range order {
+		hashes[v] = i
+	}
+	return hashes
+}
+
+func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) *LeisureSession {
 	session := &LeisureSession{
 		Peer: "",
 		//SessionId:    fmt.Sprint(sv.unixSocket, '-', sessionId),
-		SessionId:    sessionId,
-		PendingOps:   make([]doc.Replacement, 0, 8),
-		History:      history,
-		Follow:       "",
-		key:          nil,
-		service:      sv.LeisureService,
-		hasUpdate:    false,
-		updates:      nil,
-		lastUsed:     time.Now(),
-		wantsOrg:     wantsOrg,
-		wantsStrings: wantsStrings,
-		dataMode:     dataOnly,
-		chunks:       &org.OrgChunks{},
+		SessionId:     sessionId,
+		PendingOps:    make([]doc.Replacement, 0, 8),
+		History:       history,
+		Follow:        "",
+		key:           nil,
+		service:       sv.LeisureService,
+		hasUpdate:     false,
+		updates:       nil,
+		lastUsed:      time.Now(),
+		wantsOrg:      wantsOrg,
+		wantsStrings:  wantsStrings,
+		dataMode:      dataOnly,
+		chunks:        &org.OrgChunks{},
+		updateTimeout: updateTimeout,
 	}
 	sv.sessions[session.SessionId] = session
 	sv.session = session
@@ -588,12 +638,19 @@ func (sv *LeisureContext) sessionList() {
 	sv.writeResponse(sessions)
 }
 
-func (sv *LeisureContext) getParams() (string, bool, bool, bool) {
+func (sv *LeisureContext) getParams() (string, bool, bool, bool, time.Duration, string) {
 	docId := sv.r.URL.Query().Get("doc")
 	wantsStrings := strings.ToLower(sv.r.URL.Query().Get("strings")) != "false"
 	wantsOrg := strings.ToLower(sv.r.URL.Query().Get("org")) == "true"
 	dataMode := strings.ToLower(sv.r.URL.Query().Get("dataOnly")) == "true"
-	return docId, wantsOrg, wantsStrings, dataMode
+	updateTimeout := UPDATE_TIME
+	badTimeout := ""
+	if waitTime := sv.r.URL.Query().Get("timeout"); waitTime != "" {
+		if _, err := fmt.Sscanf(waitTime, "%d", &updateTimeout); err != nil {
+			badTimeout = waitTime
+		}
+	}
+	return docId, wantsOrg, wantsStrings, dataMode, updateTimeout, badTimeout
 }
 
 // URL: GET or POST /session/connect/SESSION_ID
@@ -614,7 +671,10 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 	if !ok {
 		return nil, sv.error(ErrCommandFormat, "Bad connect format, should be %sID but was %s", SESSION_CONNECT, sv.r.URL.RequestURI())
 	}
-	docId, wantsOrg, wantsStrings, dataMode := sv.getParams()
+	docId, wantsOrg, wantsStrings, dataMode, timeout, badTimeout := sv.getParams()
+	if badTimeout != "" {
+		return nil, sv.error(ErrCommandFormat, "Bad timeout parameter: %s", badTimeout)
+	}
 	force := strings.ToLower(sv.r.URL.Query().Get("force")) == "true"
 	history := sv.documents[docId]
 	if history == nil && sv.documentAliases[docId] != "" {
@@ -638,7 +698,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 		} else if history != nil {
 			// this is a new session and the document already exists
 			if len(getEdits(history.GetLatestDocument().String(), string(incoming))) == 0 {
-				sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
+				sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
 				return false, nil
 			}
 			// continue with connection
@@ -655,7 +715,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 				docId = uuid.String()
 			}
 			sv.addDoc(docId, alias, string(incoming))
-			sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode)
+			sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
 			return true, nil
 		}
 	}
@@ -663,7 +723,7 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 		if history == nil {
 			return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
 		}
-		sv.session = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode)
+		sv.session = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode, timeout)
 	}
 	content := sv.session.GetLatestDocument().String()
 	result := any(content)
@@ -829,6 +889,20 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		sv.session.ReplaceAll(repl)
 		sv.session.hasUpdate = false
 		replacements, off, length := sv.session.Commit(offset.asInt(), length.asInt())
+		if sv.verbosity > 0 {
+			block := sv.session.Latest[sv.session.SessionId]
+			hashNums := sv.session.hashNums()
+			blocknum := hashNums[block.Hash]
+			parents := make([]string, 0, 8)
+			for _, v := range block.Parents {
+				parents = append(parents, fmt.Sprintf("%d", hashNums[v]))
+			}
+			repls := make([]string, 0, 8)
+			for _, v := range block.Replacements {
+				repls = append(repls, fmt.Sprintf("(%d,%d -> '%s')", v.Offset, v.Offset+v.Length-1, v.Text))
+			}
+			sv.verbose("@ BLOCK %d %s (%s): %s", blocknum, block.SessionId, strings.Join(parents, ", "), strings.Join(repls, " "))
+		}
 		if offset.asInt() > 0 {
 			sv.verbose("OFFSET: %d -> %d\n", offset.asInt(), off)
 		}
@@ -945,11 +1019,7 @@ func asError(err any) error {
 }
 
 func (session *LeisureSession) latestBlock() *hist.OpBlock {
-	blk := session.Latest[session.SessionId]
-	if blk == nil {
-		blk = session.Source
-	}
-	return blk
+	return session.LatestBlock(session.SessionId)
 }
 
 // URL: GET /session/document -- get the document for the session
@@ -964,13 +1034,21 @@ func (sv *LeisureContext) sessionDocument() {
 }
 
 // URL: GET /session/update -- return whether there is an update
-// if there is not yet an update, wait for one up to UPDATE_TIME before returning
+// if there is not yet an update, wait up to UPDATE_TIME for an update before returning
 func (sv *LeisureContext) sessionUpdate() {
 	ch := make(chan bool)
 	svc(sv.service, func() {
 		err := sv.checkSession()
 		if err == nil && !sv.session.hasUpdate {
-			timer := time.After(UPDATE_TIME)
+			timeout := UPDATE_TIME
+			if waitTime := sv.r.URL.Query().Get("timeout"); waitTime != "" {
+				millis := 0
+				_, err = fmt.Sscanf(waitTime, "%d", &millis)
+				fmt.Fprintln(os.Stderr, "PARSED TIMEOUT: ", millis)
+				timeout = time.Duration(millis * int(time.Millisecond))
+				fmt.Fprintln(os.Stderr, "ACTUAL TIMEOUT: ", timeout)
+			}
+			timer := time.After(timeout)
 			oldUpdates := sv.session.updates
 			newUpdates := make(chan bool)
 			sv.session.updates = newUpdates
@@ -981,6 +1059,9 @@ func (sv *LeisureContext) sessionUpdate() {
 				case <-timer:
 				}
 				sv.jsonResponseSvc(func() (any, error) {
+					if err != nil {
+						return nil, sv.error(err, "")
+					}
 					if oldUpdates != nil {
 						go func() { oldUpdates <- hadUpdate }()
 					}
@@ -1024,7 +1105,7 @@ func (sv *LeisureContext) sessionGet() (result any, err error) {
 		return nil, sv.error(ErrCommandFormat, "Not in datamode or orgmode")
 	} else if name := path.Base(sv.r.URL.Path); name == "" {
 		return nil, sv.error(ErrCommandFormat, "Bad get command, no name")
-	} else if data := sv.session.chunks.GetChunkNamed(name); data.Chunks.IsEmpty() {
+	} else if data := sv.session.chunks.GetChunkNamed(name); data.IsEmpty() {
 		return nil, sv.error(ErrDataMissing, "No data named %s", name)
 	} else {
 		name, dt := extractData(data.Chunk, sv.session.wantsOrg)
@@ -1046,26 +1127,68 @@ func (sv *LeisureContext) sessionSet(arg jsonObj) (result any, err error) {
 	}()
 	if err := sv.checkSession(); err != nil {
 		return nil, sv.error(err, "")
-	} else if name := path.Base(sv.r.URL.Path); name == "" {
-		return nil, sv.error(ErrCommandFormat, "Bad set command, no name")
-	} else if offset, data := sv.session.chunks.LocateChunkNamed(name); data.Chunks.IsEmpty() {
+	} else if sv.r.URL.Path == SESSION_SET {
+		return sv.sessionSetMultiple(arg)
+	} else {
+		name := path.Base(sv.r.URL.Path)
+		//fmt.Printf("NAME: %s\n", name)
+		offset, data := sv.session.chunks.LocateChunkNamed(name)
+		return sv.addOrSet(name, arg, force, true, offset, data)
+	}
+}
+
+func (sv *LeisureContext) addOrSet(name string, value jsonObj, force, commit bool, offset int, data org.ChunkRef) (result any, err error) {
+	if data.IsEmpty() {
 		if !force {
-			return nil, sv.error(ErrDataMissing, "No data named %s", name)
+			docstr := sv.session.latestBlock().GetDocument(sv.session.History).String()
+			parsed := org.Parse(docstr)
+			_, r := parsed.LocateChunkNamed(name)
+			println("CHUNKS")
+			org.DisplayChunks("  ", parsed.Chunks)
+			return nil, sv.error(ErrDataMissing, "No data named %s\nREPARSED CHUNK: %#v\nDOCUMENT:%s", name, r, docstr)
 		}
-		sv.addData(name, arg)
+		sv.addData(name, value, commit)
 		return true, nil
 	} else if src, ok := data.Chunk.(*org.SourceBlock); ok {
 		if src.IsData() {
-			return sv.setData(offset, src.Content, src.End, src, arg)
+			return sv.setData(offset, src.Content, src.End, src, value, commit)
 		}
 		return nil, sv.error(ErrDataMismatch, "%s is not a data block", name)
 	} else if tbl, ok := data.Chunk.(*org.TableBlock); ok {
-		return sv.setData(offset, tbl.TblStart, 0, tbl, arg)
+		return sv.setData(offset, tbl.TblStart, len(tbl.Text), tbl, value, commit)
 	}
 	return nil, sv.error(ErrUnknown, "Unknown error")
 }
 
-func (sv *LeisureContext) addData(name string, value any) (any, error) {
+// URL: POST /session/set
+func (sv *LeisureContext) sessionSetMultiple(arg jsonObj) (result any, err error) {
+	force := strings.ToLower(sv.r.URL.Query().Get("force")) == "true"
+	if m, ok := arg.v.(map[string]any); !ok {
+		return nil, sv.error(ErrCommandFormat, "Expected an object with name -> data but got %v", arg)
+	} else {
+		// reverse-sort changes so they can be applied properly
+		// because addOrSet with no commit only records the replacement
+		// it does not change the document
+		changes := make([]DataChange, len(m))
+		pos := 0
+		for name, value := range m {
+			location, data := sv.session.chunks.LocateChunkNamed(name)
+			if data.IsEmpty() && !force {
+				org.DisplayChunks("  ", sv.session.chunks.Chunks)
+				return nil, sv.error(ErrDataMissing, "No data named '%s'", name)
+			}
+			changes[pos] = DataChange{name, jsonV(value), data, location}
+		}
+		slices.SortFunc(changes, func(a, b DataChange) int { return b.location - a.location })
+		for _, change := range changes {
+			sv.addOrSet(change.name, change.value, true, false, change.location, change.data)
+		}
+		replacements, newSelOff, newSelLen := sv.session.Commit(-1, -1)
+		return sv.changes(newSelOff, newSelLen, replacements, true), nil
+	}
+}
+
+func (sv *LeisureContext) addData(name string, value any, commit bool) (any, error) {
 	str := sv.session.latestBlock().GetDocument(sv.session.History).String()
 	sb := strings.Builder{}
 	if str[len(str)-1] != '\n' {
@@ -1077,34 +1200,36 @@ func (sv *LeisureContext) addData(name string, value any) (any, error) {
 		text := strings.TrimSpace(string(bytes))
 		fmt.Fprintf(&sb, `#+name: %s\n#+begin_src yaml\n%s\n`, name, text)
 	}
-	return sv.replaceText(-1, -1, len(str), 0, sb.String())
+	return sv.replaceText(-1, -1, len(str), 0, sb.String(), commit)
 }
 
-func (sv *LeisureContext) replaceText(selOff, selLen, offset, length int, text string) (any, error) {
+func (sv *LeisureContext) replaceText(selOff, selLen, offset, length int, text string, commit bool) (any, error) {
 	sv.session.Replace(offset, length, text)
+	if !commit {
+		return nil, nil
+	}
 	sv.session.hasUpdate = false
 	replacements, newSelOff, newSelLen := sv.session.Commit(selOff, selLen)
 	return sv.changes(newSelOff, newSelLen, replacements, true), nil
 }
 
-func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, value jsonObj) (any, error) {
+func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, value jsonObj, commit bool) (any, error) {
 	if newText, err := ch.SetValue(value.v); err != nil {
 		return nil, err
 	} else {
 		sv.verbose("NEW DATA:", newText)
-		end += len(newText) - len(ch.AsOrgChunk().Text)
+		newEnd := end + len(newText) - len(ch.AsOrgChunk().Text)
 		sv.verbose("WANTS ORG:", sv.session.wantsOrg)
-		result, err := sv.replaceText(-1, -1, offset+start, end-start, newText[start:end])
-		fmt.Println("WANTS ORG: ", sv.session.wantsOrg)
-		if err == nil && sv.session.wantsOrg {
-			fmt.Println("RETURNING JSON")
+		result, err := sv.replaceText(-1, -1, offset+start, end-start, newText[start:newEnd], commit)
+		if err == nil && sv.session.wantsOrg && commit {
+			//fmt.Println("RETURNING JSON")
 			obj := jmap("replacements", result, "chunk", sv.session.chunks.GetChunkAt(offset+start))
 			if data, err := json.Marshal(obj); err != nil {
 				sv.verboseN(1, "Writing error %s", err)
 				if sv.verbosity > 0 {
 					debug.PrintStack()
 				}
-				fmt.Println("RETURNING JSON: ", data)
+				//fmt.Println("RETURNING JSON: ", data)
 				return data, nil
 			} else {
 				return nil, err
@@ -1126,10 +1251,10 @@ func (sv *LeisureContext) sessionAdd(value jsonObj) (result any, err error) {
 		return nil, sv.error(err, "")
 	} else if name := path.Base(sv.r.URL.Path); name == "" {
 		return nil, sv.error(ErrCommandFormat, "Bad add command, no name")
-	} else if _, data := sv.session.chunks.LocateChunkNamed(name); !data.Chunks.IsEmpty() {
+	} else if _, data := sv.session.chunks.LocateChunkNamed(name); !data.IsEmpty() {
 		return nil, sv.error(ErrDataMismatch, "Already data named %s", name)
 	} else {
-		return sv.addData(name, value)
+		return sv.addData(name, value, true)
 	}
 }
 
@@ -1145,10 +1270,10 @@ func (sv *LeisureContext) sessionRemove() (result any, err error) {
 		return nil, sv.error(err, "")
 	} else if name := path.Base(sv.r.URL.Path); name == "" {
 		return nil, sv.error(ErrCommandFormat, "Bad add command, no name")
-	} else if offset, data := sv.session.chunks.LocateChunkNamed(name); data.Chunks.IsEmpty() {
+	} else if offset, data := sv.session.chunks.LocateChunkNamed(name); data.IsEmpty() {
 		return nil, sv.error(ErrDataMismatch, "No data named %s", name)
 	} else {
-		return sv.replaceText(-1, -1, offset, len(data.Chunk.AsOrgChunk().Text), "")
+		return sv.replaceText(-1, -1, offset, len(data.Chunk.AsOrgChunk().Text), "", true)
 	}
 }
 
@@ -1220,29 +1345,38 @@ func MemoryStorage(id, content string) hist.DocStorage {
 	return hist.NewMemoryStorage(content)
 }
 
-func (sv *LeisureService) handleJson(mux *http.ServeMux, url string, fn func(*LeisureContext, jsonObj) (any, error)) {
+func (sv *LeisureService) handleFunc(mux *http.ServeMux, url string, fn func(http.ResponseWriter, *http.Request)) {
 	mux.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+		if sv.verbosity > 0 {
+			fmt.Fprintln(os.Stderr, "REQUEST: ", r.URL)
+		}
+		fn(w, r)
+	})
+}
+
+func (sv *LeisureService) handleJson(mux *http.ServeMux, url string, fn func(*LeisureContext, jsonObj) (any, error)) {
+	sv.handleFunc(mux, url, func(w http.ResponseWriter, r *http.Request) {
 		ct := &LeisureContext{sv, w, r, sv.findSession(r)}
 		ct.jsonSvc(func(arg jsonObj) (any, error) { return fn(ct, arg) })
 	})
 }
 
 func (sv *LeisureService) handleJsonResponse(mux *http.ServeMux, url string, fn func(ct *LeisureContext) (any, error)) {
-	mux.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+	sv.handleFunc(mux, url, func(w http.ResponseWriter, r *http.Request) {
 		ct := &LeisureContext{sv, w, r, sv.findSession(r)}
 		ct.jsonResponse(func() (any, error) { return fn(ct) })
 	})
 }
 
 func (sv *LeisureService) handleSync(mux *http.ServeMux, url string, fn func(*LeisureContext)) {
-	mux.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+	sv.handleFunc(mux, url, func(w http.ResponseWriter, r *http.Request) {
 		ct := &LeisureContext{sv, w, r, sv.findSession(r)}
 		ct.svcSync(func() { fn(ct) })
 	})
 }
 
 func (sv *LeisureService) handle(mux *http.ServeMux, url string, fn func(*LeisureContext)) {
-	mux.HandleFunc(url, func(w http.ResponseWriter, r *http.Request) {
+	sv.handleFunc(mux, url, func(w http.ResponseWriter, r *http.Request) {
 		fn(&LeisureContext{sv, w, r, sv.findSession(r)})
 	})
 }
