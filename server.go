@@ -70,6 +70,7 @@ var ErrExpiredSession = NewLeisureError("expiredSession")
 var ErrInternalError = NewLeisureError("internalError")
 var ErrDataMissing = NewLeisureError("dataMissing")
 var ErrDataMismatch = NewLeisureError("dataMismatch")
+var ErrSessionType = NewLeisureError("badSessionType")
 
 const (
 	DEFAULT_COOKIE_TIMEOUT = 5 * time.Minute
@@ -137,6 +138,7 @@ const (
 	SESSION_GET      = VERSION + "/session/get/"
 	SESSION_SET      = VERSION + "/session/set/"
 	SESSION_REMOVE   = VERSION + "/session/remove/"
+	SESSION_TAG      = VERSION + "/session/tag/"
 	ORG_PARSE        = VERSION + "/org/parse"
 	STOP             = VERSION + "/stop"
 )
@@ -192,7 +194,7 @@ func jsonFor(data []byte) (any, error) {
 // these will unwind the current document to the common ancestor and replay to the current version
 func (s *LeisureSession) Commit(selOff int, selLen int) ([]doc.Replacement, int, int) {
 	ops := s.PendingOps
-	if s.wantsOrg {
+	if s.wantsOrg || s.dataMode {
 		// this will be more efficient that reparsing the entire document
 		for _, op := range s.PendingOps {
 			s.chunks.Replace(op.Offset, op.Length, op.Text)
@@ -1252,6 +1254,26 @@ func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, valu
 	}
 }
 
+// URL: POST /session/tag/NAME
+func (sv *LeisureContext) sessionTag() (result any, err error) {
+	// set err if there's a panic
+	defer func() {
+		if errObj := recover(); errObj != nil {
+			err = sv.error(errObj, "")
+		}
+	}()
+	if err := sv.checkSession(); err != nil {
+		return nil, sv.error(err, "")
+	} else if !(sv.session.wantsOrg || sv.session.dataMode) {
+		return nil, sv.error(ErrSessionType, "Only org or data sessions can find tags")
+	} else if sv.r.URL.Path == SESSION_TAG {
+		return nil, sv.error(ErrCommandFormat, "Tag search requires a name")
+	}
+	name := path.Base(sv.r.URL.Path)
+	//fmt.Printf("NAME: %s\n", name)
+	return sv.session.chunks.GetChunksTagged(name), nil
+}
+
 // URL: POST /session/add/NAME
 func (sv *LeisureContext) sessionAdd(value jsonObj) (result any, err error) {
 	// set err if there's a panic
@@ -1423,6 +1445,7 @@ func Initialize(id string, mux *http.ServeMux, storageFactory func(string, strin
 	sv.handle(mux, SESSION_UPDATE, (*LeisureContext).sessionUpdate)
 	sv.handleJsonResponse(mux, SESSION_GET, (*LeisureContext).sessionGet)
 	sv.handleJson(mux, SESSION_SET, (*LeisureContext).sessionSet)
+	sv.handleJsonResponse(mux, SESSION_TAG, (*LeisureContext).sessionTag)
 	sv.handleJsonResponse(mux, ORG_PARSE, (*LeisureContext).orgParse)
 	sv.handle(mux, STOP, (*LeisureContext).stop)
 	runSvc(sv.service)
