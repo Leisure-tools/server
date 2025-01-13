@@ -385,8 +385,22 @@ func (sv *LeisureContext) docGet() (any, error) {
 	}
 }
 
-func (sv *LeisureContext) documentResult(doc string) (string, error) {
-	if dump := sv.r.URL.Query().Get("dump"); dump != "" {
+func (sv *LeisureContext) documentResult(doc string, modes ...bool) (any, error) {
+	dump := false
+	wantData := false
+	wantOrg := false
+	if len(modes) > 0 {
+		dump = modes[0]
+		wantData = modes[1]
+		wantOrg = modes[2]
+	} else if sv.r.URL.Query().Get("dump") != "" {
+		dump = true
+	} else if sv.r.URL.Query().Get("org") != "" {
+		wantOrg = true
+	} else if sv.r.URL.Query().Get("data") != "" {
+		wantData = true
+	}
+	if dump {
 		parsed := org.Parse(doc)
 		buf := &bytes.Buffer{}
 		fmt.Fprintln(buf, "CHUNKS:")
@@ -394,15 +408,10 @@ func (sv *LeisureContext) documentResult(doc string) (string, error) {
 		fmt.Fprintln(buf, "\nTREE:")
 		parsed.Chunks.Dump(buf, 0)
 		return buf.String(), nil
-	} else if wantOrg := sv.r.URL.Query().Get("org"); wantOrg != "" {
-		obj := jmap("document", doc, "chunks", org.Parse(doc))
-		if result, err := json.Marshal(obj); err != nil {
-			return "", err
-		} else {
-			buf := &bytes.Buffer{}
-			buf.Write(result)
-			return buf.String(), nil
-		}
+	} else if wantData {
+		return sv.extractData(wantOrg), nil
+	} else if wantOrg {
+		return jmap("document", doc, "chunks", org.Parse(doc)), nil
 	}
 	return doc, nil
 }
@@ -460,10 +469,14 @@ func getEdits(oldDoc, newDoc string) []doc.Replacement {
 	return repls
 }
 
-func (sv *LeisureContext) extractData() map[string]any {
+func (sv *LeisureContext) extractData(wantsOrgA ...bool) map[string]any {
+	wantsOrg := sv.session.wantsOrg
+	if len(wantsOrgA) > 0 {
+		wantsOrg = wantsOrgA[0]
+	}
 	data := map[string]any{}
 	sv.session.chunks.Chunks.Each(func(ch org.Chunk) bool {
-		name, dt := extractData(ch, sv.session.wantsOrg)
+		name, dt := extractData(ch, wantsOrg)
 		if name != "" {
 			data[name] = dt
 		}
@@ -1023,14 +1036,14 @@ func (session *LeisureSession) latestBlock() *hist.OpBlock {
 }
 
 // URL: GET /session/document -- get the document for the session
-func (sv *LeisureContext) sessionDocument() {
+func (sv *LeisureContext) sessionDocument() (any, error) {
 	if err := sv.checkSession(); err != nil {
-		sv.writeRawError(err)
-	} else {
-		doc := sv.session.latestBlock().GetDocument(sv.session.History)
-		doc.Apply(sv.session.SessionId, 0, sv.session.PendingOps)
-		sv.writeSuccess(doc.String())
+		return nil, err
 	}
+	doc := sv.session.latestBlock().GetDocument(sv.session.History)
+	doc.Apply(sv.session.SessionId, 0, sv.session.PendingOps)
+	//sv.writeSuccess(doc.String())
+	return sv.documentResult(doc.String(), false, sv.session.dataMode, sv.session.wantsOrg)
 }
 
 // URL: GET /session/update -- return whether there is an update
@@ -1044,9 +1057,9 @@ func (sv *LeisureContext) sessionUpdate() {
 			if waitTime := sv.r.URL.Query().Get("timeout"); waitTime != "" {
 				millis := 0
 				_, err = fmt.Sscanf(waitTime, "%d", &millis)
-				fmt.Fprintln(os.Stderr, "PARSED TIMEOUT: ", millis)
+				//fmt.Fprintln(os.Stderr, "PARSED TIMEOUT: ", millis)
 				timeout = time.Duration(millis * int(time.Millisecond))
-				fmt.Fprintln(os.Stderr, "ACTUAL TIMEOUT: ", timeout)
+				//fmt.Fprintln(os.Stderr, "ACTUAL TIMEOUT: ", timeout)
 			}
 			timer := time.After(timeout)
 			oldUpdates := sv.session.updates
@@ -1406,7 +1419,7 @@ func Initialize(id string, mux *http.ServeMux, storageFactory func(string, strin
 	sv.handleSync(mux, SESSION_LIST, (*LeisureContext).sessionList)
 	sv.handleJsonResponse(mux, SESSION_CONNECT, (*LeisureContext).sessionConnect)
 	sv.handleJson(mux, SESSION_EDIT, (*LeisureContext).sessionEdit)
-	sv.handleSync(mux, SESSION_DOCUMENT, (*LeisureContext).sessionDocument)
+	sv.handleJsonResponse(mux, SESSION_DOCUMENT, (*LeisureContext).sessionDocument)
 	sv.handle(mux, SESSION_UPDATE, (*LeisureContext).sessionUpdate)
 	sv.handleJsonResponse(mux, SESSION_GET, (*LeisureContext).sessionGet)
 	sv.handleJson(mux, SESSION_SET, (*LeisureContext).sessionSet)
