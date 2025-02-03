@@ -29,6 +29,27 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// API
+const (
+	VERSION          = "/v1"
+	DOC_CREATE       = VERSION + "/doc/create/"
+	DOC_GET          = VERSION + "/doc/get/"
+	DOC_LIST         = VERSION + "/doc/list"
+	SESSION_CLOSE    = VERSION + "/session/close"
+	SESSION_CONNECT  = VERSION + "/session/connect/"
+	SESSION_CREATE   = VERSION + "/session/create/"
+	SESSION_LIST     = VERSION + "/session/list"
+	SESSION_DOCUMENT = VERSION + "/session/document"
+	SESSION_EDIT     = VERSION + "/session/edit"
+	SESSION_UPDATE   = VERSION + "/session/update"
+	SESSION_GET      = VERSION + "/session/get/"
+	SESSION_SET      = VERSION + "/session/set/"
+	SESSION_REMOVE   = VERSION + "/session/remove/"
+	SESSION_TAG      = VERSION + "/session/tag/"
+	ORG_PARSE        = VERSION + "/org/parse"
+	STOP             = VERSION + "/stop"
+)
+
 const UPDATE_TIME = 2 * time.Minute
 
 type Sha = [sha256.Size]byte
@@ -122,26 +143,6 @@ type DataChange struct {
 }
 
 var emptyConnection LeisureSession
-
-const (
-	VERSION          = "/v1"
-	DOC_CREATE       = VERSION + "/doc/create/"
-	DOC_GET          = VERSION + "/doc/get/"
-	DOC_LIST         = VERSION + "/doc/list"
-	SESSION_CLOSE    = VERSION + "/session/close"
-	SESSION_CONNECT  = VERSION + "/session/connect/"
-	SESSION_CREATE   = VERSION + "/session/create/"
-	SESSION_LIST     = VERSION + "/session/list"
-	SESSION_DOCUMENT = VERSION + "/session/document"
-	SESSION_EDIT     = VERSION + "/session/edit"
-	SESSION_UPDATE   = VERSION + "/session/update"
-	SESSION_GET      = VERSION + "/session/get/"
-	SESSION_SET      = VERSION + "/session/set/"
-	SESSION_REMOVE   = VERSION + "/session/remove/"
-	SESSION_TAG      = VERSION + "/session/tag/"
-	ORG_PARSE        = VERSION + "/org/parse"
-	STOP             = VERSION + "/stop"
-)
 
 func (err LeisureError) Error() string {
 	return err.Type
@@ -395,12 +396,15 @@ func (sv *LeisureContext) documentResult(doc string, modes ...bool) (any, error)
 		dump = modes[0]
 		wantData = modes[1]
 		wantOrg = modes[2]
-	} else if sv.r.URL.Query().Get("dump") != "" {
-		dump = true
-	} else if sv.r.URL.Query().Get("org") != "" {
-		wantOrg = true
-	} else if sv.r.URL.Query().Get("data") != "" {
-		wantData = true
+	}
+	if sv.r.URL.Query().Get("dump") != "" {
+		dump = sv.r.URL.Query().Get("dump") == "true"
+	}
+	if sv.r.URL.Query().Get("org") != "" {
+		wantOrg = sv.r.URL.Query().Get("org") == "true"
+	}
+	if sv.r.URL.Query().Get("data") != "" {
+		wantData = sv.r.URL.Query().Get("data") == "true"
 	}
 	if dump {
 		parsed := org.Parse(doc)
@@ -853,13 +857,13 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		return nil, sv.error(err, "")
 	} else if !repls.isMap() {
 		return nil, sv.error(ErrCommandFormat, "expected a replacement array but got %v", repls.v)
-	} else if offset := repls.getJson("selectionOffset"); !offset.isNumber() || offset.asInt() < 0 {
+	} else if selOffset := repls.getJson("selectionOffset"); !selOffset.isNumber() || selOffset.asInt() < 0 {
 		println("BAD SELECTION OFFSET")
 		return nil, sv.error(ErrCommandFormat, "expected a selection offset in the replacement but got: %v", repls.v)
-	} else if length := repls.getJson("selectionLength"); !length.isNumber() || length.asInt() < -1 {
+	} else if selLength := repls.getJson("selectionLength"); !selLength.isNumber() || selLength.asInt() < -1 {
 		println("BAD SELECTION LENGTH")
 		return nil, sv.error(ErrCommandFormat, "expected a selection length in the replacement but got: %v", repls.v)
-	} else if repls := repls.getJson("replacements"); !repls.isArray() && !repls.isNil() {
+	} else if repls = repls.getJson("replacements"); !repls.isArray() && !repls.isNil() {
 		println("BAD REPLACEMENTS")
 		return nil, sv.error(ErrCommandFormat, "expected replacement map with a replacement array but got: %v", repls.v)
 	} else {
@@ -873,15 +877,28 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 			}
 			offset := el.getJson("offset")
 			length := el.getJson("length")
+			block := el.getJson("block")
 			text := el.getJson("text")
-			if !(offset.isNumber() && length.isNumber() && (text.isNil() || text.isString())) {
-				return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
-			} else if text.isNil() {
+			o := 0
+			l := 0
+			if text.isNil() {
 				text = jsonV("")
 			}
+			if !(text.isString() &&
+				((offset.isNil() && block.isString()) ||
+					(offset.isNumber() && block.isNil() && length.isNumber()))) {
+				return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
+			} else if !offset.isNil() {
+				o = offset.asInt()
+				l = length.asInt()
+			} else {
+				off, bl := sv.session.chunks.LocateChunk(org.OrgId(block.String()))
+				o = off
+				l = len(bl.AsOrgChunk().Text)
+			}
 			curRepl := doc.Replacement{
-				Offset: offset.asInt(),
-				Length: length.asInt(),
+				Offset: o,
+				Length: l,
 				Text:   text.asString(),
 			}
 			if curRepl.Offset < 0 || (curRepl.Length < 0 && curRepl.Offset != 0) {
@@ -903,7 +920,7 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		sv.verbose("edit: %v", repl)
 		sv.session.ReplaceAll(repl)
 		sv.session.hasUpdate = false
-		replacements, off, length := sv.session.Commit(offset.asInt(), length.asInt())
+		replacements, off, length := sv.session.Commit(selOffset.asInt(), selLength.asInt())
 		if sv.verbosity > 0 {
 			block := sv.session.Latest[sv.session.SessionId]
 			hashNums := sv.session.hashNums()
@@ -918,8 +935,8 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 			}
 			sv.verbose("@ BLOCK %d %s (%s): %s", blocknum, block.SessionId, strings.Join(parents, ", "), strings.Join(repls, " "))
 		}
-		if offset.asInt() > 0 {
-			sv.verbose("OFFSET: %d -> %d\n", offset.asInt(), off)
+		if selOffset.asInt() > 0 {
+			sv.verbose("OFFSET: %d -> %d\n", selOffset.asInt(), off)
 		}
 		return sv.changes(off, length, replacements, len(repl) > 0), nil
 	}

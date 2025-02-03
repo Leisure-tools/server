@@ -426,7 +426,11 @@ func TestEdits(tt *testing.T) {
 	keyValue := strings.Split(cookie.Value, "=")
 	t.testEqual(len(keyValue), 2, fmt.Sprintf("Bad cookie format, expected SESSION_ID=SESSION_KEY but got %s", cookie.Value))
 	_, resp := sv.get(SESSION_DOCUMENT, cookie)
-	t.testEqual(resp.buf.String(), doc1, "Bad document")
+	//fmt.Println("RESPONSE ", resp.buf)
+	//t.testEqual(resp.buf.String(), doc1, "Bad document")
+	var result any
+	t.testEqual(json.Unmarshal(resp.buf.Bytes(), &result), nil, "Could not unmarshal document")
+	t.testEqual(result, doc1, "Bad document")
 	d1 := doc.NewDocument(doc1)
 	d1.Replace("emacs", 0, index(d1.String(), 0, 5), 3, "ONE")
 	d1.Replace("emacs", 3, index(d1.String(), 2, 10), 0, "\nline four")
@@ -436,7 +440,8 @@ func TestEdits(tt *testing.T) {
 		"selectionLength", 0,
 	)))
 	_, resp = sv.get(SESSION_DOCUMENT, cookie)
-	t.testEqual(resp.buf.String(), doc1Edited, "bad document")
+	t.testEqual(json.Unmarshal(resp.buf.Bytes(), &result), nil, "Could not unmarshal document")
+	t.testEqual(result, doc1Edited, "bad document")
 	sv.shutdown()
 }
 
@@ -515,9 +520,9 @@ func TestTwoPeers(tt *testing.T) {
 	sv.post(SESSION_EDIT, vscode, t.jsonEncode(
 		t.edit(0, 0,
 			6, 5, "goodbye")))
-	sv.testGet(SESSION_DOCUMENT, vscode, "hello goodbye", "Unexpected document")
+	sv.testGet(sv.jsonDecode, SESSION_DOCUMENT, vscode, "hello goodbye", "Unexpected document")
 	sv.testGet(sv.jsonDecode, SESSION_UPDATE, emacs, true, "Expected update")
-	sv.testGet(SESSION_DOCUMENT, emacs, "hello there", "Unexpected document")
+	sv.testGet(sv.jsonDecode, SESSION_DOCUMENT, emacs, "hello there", "Unexpected document")
 	//session := sv.service.sessions["emacs"]
 	//fmt.Printf("EMACS: %v\n", session.SessionId)
 	//fmt.Printf("EMACS-lastest: %v\n", session.History.Latest[session.SessionId])
@@ -528,7 +533,7 @@ func TestTwoPeers(tt *testing.T) {
 		t.jsonEncode(t.edit(0, 0)),
 		t.edit(0, 0, 6, 5, "goodbye"),
 		"Bad replacement")
-	sv.testGet(SESSION_DOCUMENT, emacs, "hello goodbye", "Unexpected document")
+	sv.testGet(sv.jsonDecode, SESSION_DOCUMENT, emacs, "hello goodbye", "Unexpected document")
 	sv.shutdown()
 }
 
@@ -751,7 +756,8 @@ c: 3
 	//sv.service.verbosity = 1
 	cookies, _ := sv.processGet(SESSION_CREATE, "emacs", "bubba", "?", "org", "true", "dataOnly", "true")
 	emacs := cookies[0]
-	_, doc := sv.processGet(SESSION_DOCUMENT, emacs)
+	_, docstr := sv.processGet(SESSION_DOCUMENT, "?", "org", "false", "data", "false", emacs)
+	doc := t.jsonDecode([]byte(docstr))
 	t.testEqual(doc, doc0, "Bad document")
 	sv.testSet("emacs", emacs, "one", 4, doc1)
 	sv.testSet("emacs", emacs, "two", 5, doc2)
