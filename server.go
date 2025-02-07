@@ -193,16 +193,50 @@ func jsonFor(data []byte) (any, error) {
 
 // commit pending ops into an opBlock, get its document, and return the replacements
 // these will unwind the current document to the common ancestor and replay to the current version
-func (s *LeisureSession) Commit(selOff int, selLen int) ([]doc.Replacement, int, int) {
+func (s *LeisureSession) Commit(selOff int, selLen int, chng *org.ChunkChanges) ([]doc.Replacement, int, int, error) {
 	ops := s.PendingOps
+	var removed doc.Set[org.OrgId]
 	if s.wantsOrg || s.dataMode {
-		// this will be more efficient that reparsing the entire document
-		for _, op := range s.PendingOps {
-			s.chunks.Replace(op.Offset, op.Length, op.Text)
-		}
+		removed = doc.NewSet[org.OrgId]()
+		s.orgChanges(s.chunks, ops, chng, removed)
+		s.verbose("@@@\n%s REPLACING: %#v, FIRST CHANGES: %#v\n", s.SessionId, ops, chng)
+	} else {
+		s.verbose("NO CHANGES: %#v\n", chng)
 	}
 	s.PendingOps = s.PendingOps[:0]
-	return s.History.Commit(s.Peer, s.SessionId, ops, selOff, selLen)
+	newRepl, newOff, newLen, err := s.History.Commit(s.Peer, s.SessionId, ops, selOff, selLen)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if s.wantsOrg || s.dataMode {
+		s.orgChanges(s.chunks, newRepl, chng, removed)
+		s.verbose("@@@\n%s SECOND CHANGES: %#v\n", s.SessionId, chng)
+	}
+	return newRepl, newOff, newLen, nil
+}
+
+func (s *LeisureSession) orgChanges(chunks *org.OrgChunks, repls []doc.Replacement, chs *org.ChunkChanges, removed doc.Set[org.OrgId]) {
+	if len(repls) == 0 {
+		return
+	}
+	if chs.Linked == nil {
+		chs.Linked = make(map[org.OrgId]doc.Set[string])
+	}
+	// this is more efficient that reparsing the entire document
+	for _, op := range repls {
+		ch := s.chunks.Replace(op.Offset, op.Length, op.Text)
+		chs.Changed = chs.Changed.Merge(ch.Changed)
+		chs.Added = chs.Added.Merge(ch.Added)
+		for _, r := range ch.Removed {
+			if !removed.Has(r) {
+				chs.Removed = append(chs.Removed, r)
+				removed.Add(r)
+			}
+		}
+		for k, v := range ch.Linked {
+			chs.Linked[k] = chs.Linked[k].Merge(v)
+		}
+	}
 }
 
 // add a replacement to pendingOps
@@ -537,7 +571,10 @@ func (sv *LeisureContext) sessionCreate() {
 	} else if sv.sessions[sessionId] != nil {
 		sv.writeError(ErrDuplicateSession, "There is already a session named %s", sessionId)
 	} else {
-		session := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, updateTimeout)
+		session, err := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, updateTimeout)
+		if err != nil {
+			sv.writeError(ErrInternalError, fmt.Sprint("Could not add session: ", err))
+		}
 		if sv.r.Method == http.MethodPost {
 			if incoming, err := io.ReadAll(sv.r.Body); err != nil {
 				sv.writeError(ErrCommandFormat, "Could not read document contents")
@@ -602,7 +639,7 @@ func (sv *LeisureService) removeStaleSessions(d time.Duration) {
 	}
 }
 
-func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) *LeisureSession {
+func (sv *LeisureContext) addSession(sessionId, docId string, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) (*LeisureSession, error) {
 	history := sv.documents[docId]
 	if history == nil && sv.documentAliases[docId] != "" {
 		history = sv.documents[sv.documentAliases[docId]]
@@ -619,7 +656,7 @@ func (s *LeisureSession) hashNums() map[Sha]int {
 	return hashes
 }
 
-func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) *LeisureSession {
+func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.History, wantsOrg, wantsStrings, dataOnly bool, updateTimeout time.Duration) (*LeisureSession, error) {
 	session := &LeisureSession{
 		Peer: "",
 		//SessionId:    fmt.Sprint(sv.unixSocket, '-', sessionId),
@@ -642,9 +679,13 @@ func (sv *LeisureContext) addSessionWithHistory(sessionId string, history *hist.
 	sv.session = session
 	session.connect(sv.w)
 	if len(history.Latest) > 0 && history.Latest[session.SessionId] == nil {
-		session.Commit(0, 0)
+		var trackChunks org.ChunkChanges
+		_, _, _, err := session.Commit(0, 0, &trackChunks)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return session
+	return session, nil
 }
 
 // URL: GET /doc/list
@@ -717,8 +758,8 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 		} else if history != nil {
 			// this is a new session and the document already exists
 			if len(getEdits(history.GetLatestDocument().String(), string(incoming))) == 0 {
-				sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
-				return false, nil
+				_, err := sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
+				return false, err
 			}
 			// continue with connection
 		} else {
@@ -734,15 +775,19 @@ func (sv *LeisureContext) sessionConnect() (any, error) {
 				docId = uuid.String()
 			}
 			sv.addDoc(docId, alias, string(incoming))
-			sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
-			return true, nil
+			_, err = sv.addSession(sessionId, docId, wantsOrg, wantsStrings, dataMode, timeout)
+			return true, err
 		}
 	}
 	if session == nil {
 		if history == nil {
 			return nil, sv.error(ErrUnknownDocument, "No document %s", docId)
 		}
-		sv.session = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode, timeout)
+		var err error
+		sv.session, err = sv.addSessionWithHistory(sessionId, history, wantsOrg, wantsStrings, dataMode, timeout)
+		if err != nil {
+			return nil, err
+		}
 	}
 	content := sv.session.GetLatestDocument().String()
 	result := any(content)
@@ -857,7 +902,7 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		return nil, sv.error(err, "")
 	} else if !repls.isMap() {
 		return nil, sv.error(ErrCommandFormat, "expected a replacement array but got %v", repls.v)
-	} else if selOffset := repls.getJson("selectionOffset"); !selOffset.isNumber() || selOffset.asInt() < 0 {
+	} else if selOffset := repls.getJson("selectionOffset"); !selOffset.isNumber() || selOffset.asInt() < -1 {
 		println("BAD SELECTION OFFSET")
 		return nil, sv.error(ErrCommandFormat, "expected a selection offset in the replacement but got: %v", repls.v)
 	} else if selLength := repls.getJson("selectionLength"); !selLength.isNumber() || selLength.asInt() < -1 {
@@ -871,38 +916,9 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		l := repls.len()
 		for i := 0; i < l; i++ {
 			el := repls.getJson(i)
-			if !el.isMap() {
-				println("NOT MAP")
-				return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
-			}
-			offset := el.getJson("offset")
-			length := el.getJson("length")
-			block := el.getJson("block")
-			text := el.getJson("text")
-			o := 0
-			l := 0
-			if text.isNil() {
-				text = jsonV("")
-			}
-			if !(text.isString() &&
-				((offset.isNil() && block.isString()) ||
-					(offset.isNumber() && block.isNil() && length.isNumber()))) {
-				return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
-			} else if !offset.isNil() {
-				o = offset.asInt()
-				l = length.asInt()
-			} else {
-				off, bl := sv.session.chunks.LocateChunk(org.OrgId(block.String()))
-				o = off
-				l = len(bl.AsOrgChunk().Text)
-			}
-			curRepl := doc.Replacement{
-				Offset: o,
-				Length: l,
-				Text:   text.asString(),
-			}
-			if curRepl.Offset < 0 || (curRepl.Length < 0 && curRepl.Offset != 0) {
-				return nil, sv.error(ErrCommandFormat, "expected replacements but got %v", el)
+			curRepl, err := sv.replFor(el)
+			if err != nil {
+				return nil, err
 			}
 			if curRepl.Length == -1 {
 				// a complete replacement destroys earlier edits
@@ -920,7 +936,11 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		sv.verbose("edit: %v", repl)
 		sv.session.ReplaceAll(repl)
 		sv.session.hasUpdate = false
-		replacements, off, length := sv.session.Commit(selOffset.asInt(), selLength.asInt())
+		var trackChunks org.ChunkChanges
+		replacements, off, length, err := sv.session.Commit(selOffset.asInt(), selLength.asInt(), &trackChunks)
+		if err != nil {
+			return nil, err
+		}
 		if sv.verbosity > 0 {
 			block := sv.session.Latest[sv.session.SessionId]
 			hashNums := sv.session.hashNums()
@@ -938,11 +958,11 @@ func (sv *LeisureContext) sessionEdit(repls jsonObj) (result any, err error) {
 		if selOffset.asInt() > 0 {
 			sv.verbose("OFFSET: %d -> %d\n", selOffset.asInt(), off)
 		}
-		return sv.changes(off, length, replacements, len(repl) > 0), nil
+		return sv.changes(off, length, replacements, len(repl) > 0, &trackChunks), nil
 	}
 }
 
-func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replacement, update bool) map[string]any {
+func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replacement, update bool, changes *org.ChunkChanges) map[string]any {
 	if update {
 		for _, s := range sv.sessions {
 			if s == sv.session || s.hasUpdate {
@@ -962,20 +982,12 @@ func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replace
 		result["selectionOffset"] = selOff
 		result["selectionLength"] = selLen
 	}
-	if (sv.session.wantsOrg || sv.session.dataMode) && len(replacements) > 0 {
+	linkCount := len(changes.Linked)
+	changeCount := len(changes.Added) + len(changes.Changed) + len(changes.Removed) + linkCount
+	if (sv.session.wantsOrg || sv.session.dataMode) && (len(replacements) > 0 || changeCount > 0) {
 		chunks := sv.session.chunks
-		changes := &org.ChunkChanges{}
-		for _, repl := range replacements {
-			sv.verbose("INITIAL TREE")
-			org.DisplayChunks("   ", chunks.Chunks)
-			changes.Merge(chunks.Replace(repl.Offset, repl.Length, repl.Text))
-			sv.verbose("FINAL TREE:\n")
-			org.DisplayChunks("    ", chunks.Chunks)
-		}
 		chunks.RelinkHierarchy(changes)
-		sv.verbose("CHUNK CHANGES: %+v\n", changes)
-		linkCount := len(changes.Linked)
-		changeCount := len(changes.Added) + len(changes.Changed) + len(changes.Removed) + linkCount
+		sv.verbose("@@@\nCHUNK CHANGES: %+v\n", changes)
 		if changeCount == 0 || (changeCount == linkCount && sv.session.dataMode) {
 			return nil
 		} else if sv.session.dataMode {
@@ -1014,6 +1026,51 @@ func (sv *LeisureContext) changes(selOff, selLen int, replacements []doc.Replace
 		}
 	}
 	return result
+}
+
+func (sv *LeisureContext) replFor(repl jsonObj) (curRepl doc.Replacement, err error) {
+	if !repl.isMap() {
+		println("NOT MAP")
+		err = sv.error(ErrCommandFormat, "expected replacements but got %v", repl)
+		return
+	}
+	offset := repl.getJson("offset")
+	length := repl.getJson("length")
+	block := repl.getJson("block")
+	text := repl.getJson("text")
+	o := 0
+	l := 0
+	if text.isNil() {
+		text = jsonV("")
+	}
+	if !(text.isString() &&
+		((offset.isNil() && block.isString()) ||
+			(offset.isNumber() && block.isNil() && length.isNumber()))) {
+		err = sv.error(ErrCommandFormat, "expected replacements but got %v", repl)
+		return
+	} else if !offset.isNil() {
+		o = offset.asInt()
+		l = length.asInt()
+	} else {
+		off, bl := sv.session.chunks.LocateChunk(org.OrgId(block.asString()))
+		if bl.IsEmpty() {
+			fmt.Printf("COULD NOT LOCATE BLOCK '%s'\n%s", block, org.Dump(sv.session.chunks))
+			sv.session.chunks.Chunks.Dump(os.Stdout, 2)
+			err = sv.error(ErrDataMissing, "could not locate block %s", block.String())
+			return
+		}
+		o = off
+		l = len(bl.AsOrgChunk().Text)
+	}
+	if o < 0 || (l < 0 && curRepl.Offset != 0) {
+		err = sv.error(ErrCommandFormat, "expected replacements but got %v", repl)
+		return
+	}
+	return doc.Replacement{
+		Offset: o,
+		Length: l,
+		Text:   text.asString(),
+	}, nil
 }
 
 func (sv *LeisureContext) chunkSlice(chunks *org.OrgChunks, ids doc.Set[org.OrgId]) []org.ChunkRef {
@@ -1215,8 +1272,12 @@ func (sv *LeisureContext) sessionSetMultiple(arg jsonObj) (result any, err error
 		for _, change := range changes {
 			sv.addOrSet(change.name, change.value, true, false, change.location, change.data)
 		}
-		replacements, newSelOff, newSelLen := sv.session.Commit(-1, -1)
-		return sv.changes(newSelOff, newSelLen, replacements, true), nil
+		var trackChanges org.ChunkChanges
+		replacements, newSelOff, newSelLen, err := sv.session.Commit(-1, -1, &trackChanges)
+		if err != nil {
+			return nil, err
+		}
+		return sv.changes(newSelOff, newSelLen, replacements, true, &trackChanges), nil
 	}
 }
 
@@ -1235,14 +1296,18 @@ func (sv *LeisureContext) addData(name string, value any, commit bool) (any, err
 	return sv.replaceText(-1, -1, len(str), 0, sb.String(), commit)
 }
 
-func (sv *LeisureContext) replaceText(selOff, selLen, offset, length int, text string, commit bool) (any, error) {
+func (sv *LeisureContext) replaceText(selOff, selLen, offset, length int, text string, commit bool) (map[string]any, error) {
 	sv.session.Replace(offset, length, text)
 	if !commit {
 		return nil, nil
 	}
 	sv.session.hasUpdate = false
-	replacements, newSelOff, newSelLen := sv.session.Commit(selOff, selLen)
-	return sv.changes(newSelOff, newSelLen, replacements, true), nil
+	var trackChanges org.ChunkChanges
+	replacements, newSelOff, newSelLen, err := sv.session.Commit(selOff, selLen, &trackChanges)
+	if err != nil {
+		return nil, err
+	}
+	return sv.changes(newSelOff, newSelLen, replacements, true, &trackChanges), nil
 }
 
 func (sv *LeisureContext) setData(offset, start, end int, ch org.DataBlock, value jsonObj, commit bool) (any, error) {
@@ -1376,6 +1441,7 @@ func (sv *LeisureContext) jsonResponse(fn func() (any, error)) {
 	if obj, err := sv.safeCall(fn); err != nil {
 		sv.writeRawError(err)
 	} else {
+		sv.verbose("RETURNING RESULT, %s -> %#v\n", sv.r.URL, obj)
 		sv.writeResponse(obj)
 	}
 }
@@ -1431,6 +1497,21 @@ func (sv *LeisureService) handle(mux *http.ServeMux, url string, fn func(*Leisur
 	sv.handleFunc(mux, url, func(w http.ResponseWriter, r *http.Request) {
 		fn(&LeisureContext{sv, w, r, sv.findSession(r)})
 	})
+}
+
+func (s *LeisureContext) verbose(format string, args ...any) {
+	if s.session != nil {
+		s.session.verbose(format, args...)
+	} else {
+		s.LeisureService.verbose(format, args...)
+	}
+}
+
+func (s *LeisureSession) verbose(format string, args ...any) {
+	a := make([]any, 0, len(args)+1)
+	a = append(a, s.SessionId)
+	a = append(a, args...)
+	s.service.verbose("[%s]: "+format, a...)
 }
 
 func (sv *LeisureService) verbose(format string, args ...any) {
