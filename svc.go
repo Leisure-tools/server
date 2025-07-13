@@ -8,13 +8,13 @@ import (
 var verboseSvc = false
 var svcCount int64 = 0
 
-type chanSvc chan func()
+type ChanSvc chan func()
 
-func svcSync[T any](s chanSvc, code func() (T, error)) (T, error) {
+func SvcSync[T any](s ChanSvc, code func() (T, error)) (T, error) {
 	result := make(chan bool)
 	var value T
 	var err error
-	svc(s, func() {
+	Svc(s, func() {
 		value, err = code()
 		result <- true
 	})
@@ -22,7 +22,7 @@ func svcSync[T any](s chanSvc, code func() (T, error)) (T, error) {
 	return value, err
 }
 
-func svc(s chanSvc, code func()) {
+func Svc(s ChanSvc, code func()) {
 	go func() { // using a goroutine so the channel won't block
 		if verboseSvc {
 			count := atomic.AddInt64(&svcCount, 1)
@@ -39,7 +39,7 @@ func svc(s chanSvc, code func()) {
 }
 
 // Run a service. Close the channel to stop it.
-func runSvc(s chanSvc) {
+func RunSvc(s ChanSvc) {
 	go func() {
 		for {
 			cmd, ok := <-s

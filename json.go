@@ -61,7 +61,7 @@ func getFieldMap(t reflect.Type) *fieldMap {
 	return m
 }
 
-func jmap(items ...any) map[string]any {
+func JMap(items ...any) map[string]any {
 	result := map[string]any{}
 	for i := 0; i < len(items); i += 2 {
 		switch s := items[i].(type) {
@@ -74,23 +74,23 @@ func jmap(items ...any) map[string]any {
 	return result
 }
 
-type jsonObj struct {
-	v any
+type JsonObj struct {
+	V any
 }
 
-func jsonV(value any) jsonObj {
-	if j, ok := value.(jsonObj); ok {
+func JsonV(value any) JsonObj {
+	if j, ok := value.(JsonObj); ok {
 		return j
 	}
-	return jsonObj{value}
+	return JsonObj{value}
 }
 
-func (j jsonObj) value() reflect.Value {
-	return reflect.ValueOf(j.v)
+func (j JsonObj) Value() reflect.Value {
+	return reflect.ValueOf(j.V)
 }
 
-func (j jsonObj) baseType() reflect.Type {
-	return baseType(j.value().Type())
+func (j JsonObj) BaseType() reflect.Type {
+	return baseType(j.Value().Type())
 }
 
 func baseType(t reflect.Type) reflect.Type {
@@ -100,8 +100,8 @@ func baseType(t reflect.Type) reflect.Type {
 	return t
 }
 
-func (j jsonObj) baseValue() reflect.Value {
-	return baseValue(j.value())
+func (j JsonObj) BaseValue() reflect.Value {
+	return baseValue(j.Value())
 }
 
 func baseValue(v reflect.Value) reflect.Value {
@@ -111,25 +111,25 @@ func baseValue(v reflect.Value) reflect.Value {
 	return v
 }
 
-func (j jsonObj) len() int {
-	if j.v == nil {
+func (j JsonObj) Len() int {
+	if j.V == nil {
 		return 0
 	}
-	t := j.baseType()
+	t := j.BaseType()
 	switch t.Kind() {
 	case reflect.Slice, reflect.Array, reflect.Map:
-		return j.baseValue().Len()
+		return j.BaseValue().Len()
 	case reflect.Struct:
 		return len(getFieldMap(t).fields)
 	}
 	return 0
 }
 
-func (j jsonObj) typeof() string {
-	if j.v == nil {
+func (j JsonObj) TypeOf() string {
+	if j.V == nil {
 		return "object"
 	}
-	switch j.baseType().Kind() {
+	switch j.BaseType().Kind() {
 	case reflect.Map, reflect.Struct:
 		return "object"
 	case reflect.Slice, reflect.Array:
@@ -144,13 +144,13 @@ func (j jsonObj) typeof() string {
 	}
 }
 
-func (j jsonObj) getJson(key any) jsonObj {
-	return jsonV(j.get(key))
+func (j JsonObj) GetJson(key any) JsonObj {
+	return JsonV(j.Get(key))
 }
 
-func (j jsonObj) keys() []string {
+func (j JsonObj) Keys() []string {
 	keys := make([]string, 0, 4)
-	v := j.baseValue()
+	v := j.BaseValue()
 	switch v.Kind() {
 	case reflect.Struct:
 		return getFieldMap(v.Type()).properties
@@ -177,14 +177,14 @@ func (j jsonObj) keys() []string {
 	return keys
 }
 
-func (j jsonObj) get(key any) any {
-	if j.v == nil {
+func (j JsonObj) Get(key any) any {
+	if j.V == nil {
 		if _, ok := key.(string); ok {
 			return nil
 		}
 		panic("Attempt to index nil")
 	}
-	v := j.baseValue()
+	v := j.BaseValue()
 	switch v.Kind() {
 	case reflect.Struct:
 		fieldMap := getFieldMap(v.Type())
@@ -240,21 +240,21 @@ func value(v reflect.Value) any {
 	}
 }
 
-func (j jsonObj) String() string {
-	switch j.typeof() {
+func (j JsonObj) String() string {
+	switch j.TypeOf() {
 	case "string":
-		return "\"" + strings.ReplaceAll(j.asString(), "\"", "\\\"") + "\""
+		return "\"" + strings.ReplaceAll(j.AsString(), "\"", "\\\"") + "\""
 	case "array":
 		sb := &strings.Builder{}
 		sb.WriteString("[")
 		first := true
-		for i := 0; i < j.len(); i++ {
+		for i := 0; i < j.Len(); i++ {
 			if first {
 				first = false
 			} else {
 				sb.WriteString(",")
 			}
-			sb.WriteString(j.getJson(i).String())
+			sb.WriteString(j.GetJson(i).String())
 		}
 		sb.WriteString("]")
 		return sb.String()
@@ -262,69 +262,69 @@ func (j jsonObj) String() string {
 		sb := &strings.Builder{}
 		sb.WriteString("{")
 		first := true
-		for _, key := range j.keys() {
+		for _, key := range j.Keys() {
 			if first {
 				first = false
 			} else {
 				sb.WriteString(",")
 			}
-			sb.WriteString(jsonV(key).asString())
+			sb.WriteString(JsonV(key).AsString())
 			sb.WriteString(":")
-			sb.WriteString(j.getJson(key).String())
+			sb.WriteString(j.GetJson(key).String())
 		}
 		sb.WriteString("}")
 		return sb.String()
 	default:
-		return fmt.Sprint(j.v)
+		return fmt.Sprint(j.V)
 	}
 }
 
-func (j jsonObj) isNil() bool {
-	return j.v == nil
+func (j JsonObj) IsNil() bool {
+	return j.V == nil
 }
 
-func (j jsonObj) isString() bool {
-	switch j.v.(type) {
+func (j JsonObj) IsString() bool {
+	switch j.V.(type) {
 	case string:
 		return true
 	}
 	return false
 }
 
-func (j jsonObj) asString() string {
-	switch s := j.v.(type) {
+func (j JsonObj) AsString() string {
+	switch s := j.V.(type) {
 	case string:
 		return s
 	}
-	panic(fmt.Sprintf("%v is not a string", j.v))
+	panic(fmt.Sprintf("%v is not a string", j.V))
 }
 
-func (j jsonObj) isNumber() bool {
-	switch j.v.(type) {
+func (j JsonObj) IsNumber() bool {
+	switch j.V.(type) {
 	case int, int8, int16, int32, int64, float32, float64:
 		return true
 	}
 	return false
 }
 
-func (j jsonObj) isInt() bool {
-	switch j.v.(type) {
+func (j JsonObj) IsInt() bool {
+	switch j.V.(type) {
 	case int, int8, int16, int32, int64:
 		return true
 	}
 	return false
 }
 
-func (j jsonObj) isFloat() bool {
-	switch j.v.(type) {
+func (j JsonObj) IsFloat() bool {
+	switch j.V.(type) {
 	case float32, float64:
 		return true
 	}
 	return false
 }
 
-func (j jsonObj) asInt() int {
-	switch i := j.v.(type) {
+func (j JsonObj) AsInt() int {
+	switch i := j.V.(type) {
 	case int:
 		return i
 	case int8:
@@ -343,8 +343,8 @@ func (j jsonObj) asInt() int {
 	return 0
 }
 
-func (j jsonObj) asInt64() int64 {
-	switch i := j.v.(type) {
+func (j JsonObj) AsInt64() int64 {
+	switch i := j.V.(type) {
 	case int:
 		return int64(i)
 	case int8:
@@ -363,16 +363,16 @@ func (j jsonObj) asInt64() int64 {
 	return 0
 }
 
-func (j jsonObj) isBoolean() bool {
-	switch j.v.(type) {
+func (j JsonObj) IsBoolean() bool {
+	switch j.V.(type) {
 	case bool:
 		return true
 	}
 	return false
 }
 
-func (j jsonObj) asFloat64() float64 {
-	switch i := j.v.(type) {
+func (j JsonObj) AsFloat64() float64 {
+	switch i := j.V.(type) {
 	case int:
 		return float64(i)
 	case int8:
@@ -391,10 +391,10 @@ func (j jsonObj) asFloat64() float64 {
 	return 0
 }
 
-func (j jsonObj) isArray() bool {
-	return j.value().Kind() == reflect.Slice
+func (j JsonObj) IsArray() bool {
+	return j.Value().Kind() == reflect.Slice
 }
 
-func (j jsonObj) isMap() bool {
-	return j.value().Kind() == reflect.Map
+func (j JsonObj) IsMap() bool {
+	return j.Value().Kind() == reflect.Map
 }
