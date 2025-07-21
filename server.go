@@ -1248,39 +1248,28 @@ func (s *LeisureSession) mergeExternalChanges(d *doc.Document) {
 func (s *LeisureSession) ComputeInsertRepl(chunks *org.OrgChunks, blk map[string]any, out *bytes.Buffer) (repl doc.Replacement, prefixNL bool) {
 	prefixNl := false
 	name := blk["name"].(string)
-	//off, ch := s.Chunks.LocateChunkNamed(name)
 	off, ch := chunks.LocateChunkNamed(name)
 	if ch.IsEmpty() {
 		if blk["type"] == "delete" {
 			return doc.Replacement{}, false
 		}
-		// find a spot in the doc
-		//off = s.Chunks.Chunks.Measure().Width
+		// find a spot in the doc, default to end
 		off = chunks.Chunks.Measure().Width
-		//if !s.Chunks.Chunks.IsEmpty() {
 		if !chunks.Chunks.IsEmpty() {
-			//prefixNl = !strings.HasSuffix(s.Chunks.Chunks.PeekLast().AsOrgChunk().Text, "\n")
 			prefixNl = !strings.HasSuffix(chunks.Chunks.PeekLast().AsOrgChunk().Text, "\n")
 		}
-		//s.verbose("WIDTH: %d, LEN: %d", off, len(s.Chunks.GetText()))
 		s.verbose("WIDTH: %d, LEN: %d", off, len(chunks.GetText()))
 		if blk["type"] != "delete" && blk["tags"] != nil {
 		outer:
 			for tag := range u.PropStrings(blk["tags"]) {
 				// find headline with tag
-				//if t := s.Chunks.GetChunksTagged(tag); len(t) > 0 {
 				if t := chunks.GetChunksTagged(tag); len(t) > 0 {
 					for _, hl := range t {
-						//if nextId := s.Chunks.Next[hl.AsOrgChunk().Id]; nextId == "" {
 						if nextId := chunks.Next[hl.AsOrgChunk().Id]; nextId == "" {
 							continue
-							//} else if nextHl := s.Chunks.ChunkIds[nextId]; nextHl != nil {
 						} else if nextHl := chunks.ChunkIds[nextId]; nextHl != nil {
-							//off, _ = s.Chunks.LocateChunk(ch.AsOrgChunk().Id)
-							off, _ = chunks.LocateChunk(ch.AsOrgChunk().Id)
-							//if prevId := s.Chunks.Prev[nextId]; prevId != "" {
+							off, _ = chunks.LocateChunk(nextHl.AsOrgChunk().Id)
 							if prevId := chunks.Prev[nextId]; prevId != "" {
-								//prefixNl = !strings.HasSuffix(s.Chunks.ChunkIds[prevId].GetText(), "\n")
 								prefixNl = !strings.HasSuffix(chunks.ChunkIds[prevId].GetText(), "\n")
 							}
 							break outer
