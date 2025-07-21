@@ -127,7 +127,7 @@ type LeisureContext struct {
 }
 
 type SessionListener interface {
-	DocumentChanged(session *LeisureSession, changes *org.ChunkChanges)
+	DocumentChanged(session *LeisureSession, changes *org.ChunkChanges, removed map[org.OrgId]org.Chunk)
 }
 
 type LeisureSession struct {
@@ -227,9 +227,9 @@ func (s *LeisureSession) AddListener(l SessionListener) {
 	s.Listeners = append(s.Listeners, l)
 }
 
-func (s *LeisureSession) notifyListeners(changes *org.ChunkChanges) {
+func (s *LeisureSession) notifyListeners(changes *org.ChunkChanges, removed map[org.OrgId]org.Chunk) {
 	for _, l := range s.Listeners {
-		l.DocumentChanged(s, changes)
+		l.DocumentChanged(s, changes, removed)
 	}
 }
 
@@ -1004,7 +1004,7 @@ func (sv *LeisureContext) sessionEdit(repls JsonObj) (result any, err error) {
 	} else {
 		repl := make([]doc.Replacement, 0, 4)
 		l := repls.Len()
-		for i := 0; i < l; i++ {
+		for i := range l {
 			el := repls.GetJson(i)
 			curRepl, err := sv.replFor(el)
 			if err != nil {
@@ -1023,6 +1023,69 @@ func (sv *LeisureContext) sessionEdit(repls JsonObj) (result any, err error) {
 	}
 }
 
+func chunkNamed(t org.OrgTree, n string) org.Chunk {
+	_, r := t.Split(func(m org.OrgMeasure) bool {
+		return m.Names.Has(n)
+	})
+	if r.IsEmpty() {
+		return nil
+	}
+	return r.PeekFirst()
+}
+
+func namedChunks(oc *org.OrgChunks) (*org.OrgChunks, org.OrgTree, map[string]org.Chunk, u.Set[string]) {
+	t := oc.Chunks
+	chunks := map[string]org.Chunk{}
+	names := t.Measure().Names
+	for name := range names {
+		if ch := chunkNamed(t, name); ch != nil {
+			chunks[name] = ch
+		}
+	}
+	return oc, t, chunks, names
+}
+
+func (s *LeisureSession) SimpleOrgChanges(d1, d2 *doc.Document, changer string, chs *org.ChunkChanges, removed map[org.OrgId]org.Chunk) *org.OrgChunks {
+	_, _, chunks0, names0 := namedChunks(s.Chunks)
+	result, _, chunks1, names1 := namedChunks(org.Parse(d1.String()))
+	add := names1.Complement(names0)
+	remove := names0.Complement(names1)
+	change := u.NewSet[string]()
+	for name := range names0 {
+		if names1[name] && chunks0[name].GetText() != chunks1[name].GetText() {
+			change.Add(name)
+		}
+	}
+	if d1.GetOps() != d2.GetOps() {
+		result2, _, chunks2, names2 := namedChunks(org.Parse(d2.String()))
+		add.Merge(change.Complement(names2))
+		add.Subtract(names2)
+		change.Subtract(names2)
+		remove.Subtract(names2)
+		chunks1 = chunks2
+		result = result2
+	}
+	popNames := func(chunks map[string]org.Chunk, names u.Set[string], ids u.Set[org.OrgId]) {
+		for name := range names {
+			ids.Add(chunks[name].AsOrgChunk().Id)
+		}
+	}
+	chs.Added = u.NewSet[org.OrgId]()
+	chs.Changed = u.NewSet[org.OrgId]()
+	chs.Removed = make([]org.OrgId, 0, len(remove))
+	popNames(chunks1, add, chs.Added)
+	popNames(chunks1, change, chs.Changed)
+	for name := range remove {
+		chunk := chunks0[name]
+		id := chunk.AsOrgChunk().Id
+		chs.Removed = append(chs.Removed, id)
+		removed[id] = chunk
+	}
+	popNames(chunks1, add, chs.Added)
+	popNames(chunks1, change, chs.Changed)
+	return result
+}
+
 // edit session for exclusive editor
 // merge together external replacements (like from REDIS) with the editor's replacements
 func (s *LeisureSession) ExclusiveSessionEdit(repl []doc.Replacement, selOffset, selLength int) map[string]any {
@@ -1034,25 +1097,41 @@ func (s *LeisureSession) ExclusiveSessionEdit(repl []doc.Replacement, selOffset,
 	}
 	s.verbose("\n@@@\n@@@ EDIT: %#v\n@@@ OFF: %d\n@@@ LEN: %d\n@@@\n\n", repl, selOffset, selLength)
 	d := s.ExclusiveDoc.Copy()
+	chs := &org.ChunkChanges{}
+	removed := map[org.OrgId]org.Chunk{}
+	//removed := u.Set[org.OrgId]{}
+	if len(repl) > 0 {
+		//fmt.Println("Initial DOCUMENT:")
+		//fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
+		//// apply internal changes first
+		//d.Apply("internal", 0, repl)
+		//fmt.Println("AFTER INTERNAL CHANGES:")
+		////fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
+		//// apply doc changes to org chunks
+		//str := strings.Builder{}
+		//org.DumpChunks(&str, "  ", s.Chunks.Chunks)
+		//s.orgChanges(repl, &chs, removed)
+		////s.Chunks = org.Parse(d.String())
+		//if s.Chunks.GetText() != d.String() {
+		//	fmt.Fprint(os.Stderr, "@@@\n@@@  ORG TEXT DIFFERS FROM DOC TEXT AFTER INTERNAL CHANGE!!!\n@@@\n")
+		//	fmt.Fprint(os.Stderr, "ORIGINAL CHUNKS:\n", str.String())
+		//	fmt.Fprint(os.Stderr, "FINAL CHUNKS:\n")
+		//	org.DumpChunks(os.Stdout, "  ", s.Chunks.Chunks)
+		//}
+		d.Apply("internal", 0, repl)
+	}
 	if selOffset != -1 {
 		d.Mark("sel.start", selOffset)
 		d.Mark("sel.end", selOffset+selLength)
 	}
-	var chs org.ChunkChanges
-	removed := u.Set[org.OrgId]{}
-	if len(repl) > 0 {
-		fmt.Println("Initial DOCUMENT:")
-		fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
-		// apply internal changes first
-		d.Apply("internal", 0, repl)
-		fmt.Println("AFTER INTERNAL CHANGES:")
-		fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
-		// apply doc changes to org chunks
-		s.orgChanges(repl, &chs, removed)
-	}
-	s.mergeExternalChanges(d, &chs, removed)
+	d1 := d.Copy()
+	s.mergeExternalChanges(d)
+	//sadd, schange, sdelete, newOrg := s.SimpleOrgChanges(d)
+	newOrg := s.SimpleOrgChanges(d1, d, "internal", chs, removed)
+	s.Chunks = newOrg
 	fmt.Println("AFTER EXERNAL CHANGES:")
-	fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
+	//fmt.Println(strings.ReplaceAll(d.String(), "\n", "\n##  "))
+	org.DumpChunks(os.Stdout, "  ", s.Chunks.Chunks)
 	s.ExclusiveDoc = d.Freeze()
 	newOff := -1
 	newLen := -1
@@ -1064,24 +1143,20 @@ func (s *LeisureSession) ExclusiveSessionEdit(repl []doc.Replacement, selOffset,
 		newLen = newEnd - newOff
 	}
 	extRepls, _ := d.EditsFor(u.NewSet("external"), nil)
-	s.notifyListeners(&chs)
-	return s.changes(newOff, newLen, extRepls, false, &chs)
+	// need changed chunks here
+	s.notifyListeners(chs, removed)
+	return s.changes(newOff, newLen, extRepls, false, chs)
 }
 
-type Change struct {
-	name   string
-	offset int
-	chunk  org.ChunkRef
-	str    string
-}
-
-func (s *LeisureSession) mergeExternalChanges(d *doc.Document, chs *org.ChunkChanges, removed u.Set[org.OrgId]) {
+// func (s *LeisureSession) mergeExternalChanges(d *doc.Document, chs *org.ChunkChanges, removed u.Set[org.OrgId]) {
+func (s *LeisureSession) mergeExternalChanges(d *doc.Document) {
 	badBlock := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "Error, "+format, args...)
 	}
 	condensed := make([]map[string]any, 0, 10)
 	// condense block commands to only the most recent for each name
 	extBlocks := map[string]map[string]any{}
+	// note that more recent items occur first in the queue
 	for blk := range s.ExternalBlocks.Dequeue() {
 		if nameEntry, hasName := blk["name"]; !hasName {
 			badBlock("missing block name: %#v", blk)
@@ -1091,6 +1166,8 @@ func (s *LeisureSession) mergeExternalChanges(d *doc.Document, chs *org.ChunkCha
 			badBlock("missing block type: %#v", blk)
 		} else if t, ok := blk["type"].(string); !ok || !MONITOR_BLOCK_TYPES.Has(t) {
 			badBlock("bad block type %v: %#v", blk["type"], blk)
+		} else if b, has := extBlocks[name]; has && t == b["type"] {
+			continue
 		} else if t == "delete" {
 			// ensure delete block has exactly one values
 			bvalue := blk["value"]
@@ -1133,47 +1210,104 @@ func (s *LeisureSession) mergeExternalChanges(d *doc.Document, chs *org.ChunkCha
 	if extChanges == 0 {
 		return
 	}
-	changes := make([]Change, 0, extChanges)
+	chunks := org.Parse(d.String())
+	changes := make([]doc.Replacement, 0, extChanges)
 	out := &bytes.Buffer{}
+	prefixNl := false
 	for _, v := range condensed {
-		name := v["name"].(string)
-		if off, ch := s.Chunks.LocateChunkNamed(name); !ch.IsEmpty() {
-			change := Change{
-				name:   name,
-				offset: off,
-				chunk:  ch,
-			}
-			if v["type"] == "delete" {
-				change.str = ""
-			} else {
-				if err := s.ExternalFmt(out, v); err != nil {
-					fmt.Fprint(os.Stderr, err)
-				} else {
-					change.str = out.String()
-					fmt.Print("\n\nFORMATTED BLOCK: ", change.str, "\n\n\n")
+		repl, pfx := s.ComputeInsertRepl(chunks, v, out)
+		prefixNl = prefixNl || pfx
+		changes = append(changes, repl)
+	}
+	slices.SortFunc(changes, func(a, b doc.Replacement) int { return b.Offset - a.Offset })
+	d.Apply("external", 0, changes)
+	////fmt.Println("APPLIED EXTERNAL CHANGES:\n", d.Changes("  "))
+	//repls, _ := d.EditsFor(u.NewSet("external"), nil)
+	//if s.service.Verbosity > 0 {
+	//	fmt.Println("REPLACING:\n REPLS:")
+	//	for _, repl := range repls {
+	//		t := strings.ReplaceAll(repl.Text, "\n", "\\n")
+	//		t = t[:min(len(t), 60)]
+	//		fmt.Printf("  %7s [%s]\n", fmt.Sprint(repl.Offset, "-", repl.Offset+repl.Length-1), t)
+	//	}
+	//	fmt.Print("\n INTO:\n")
+	//	org.DisplayChunks("    ", s.Chunks.Chunks)
+	//}
+	//// apply doc changes to org chunks
+	//str := strings.Builder{}
+	//org.DumpChunks(&str, "  ", s.Chunks.Chunks)
+	//s.orgChanges(repls, chs, removed)
+	//if s.Chunks.GetText() != d.String() {
+	//	fmt.Fprint(os.Stderr, "@@@\n@@@  ORG TEXT DIFFERS FROM DOC TEXT AFTER EXTERNAL CHANGE!!!\n@@@\n")
+	//	fmt.Fprint(os.Stderr, "ORIGINAL CHUNKS:\n", str.String())
+	//	fmt.Fprint(os.Stderr, "FINAL CHUNKS:\n")
+	//	org.DumpChunks(os.Stdout, "  ", s.Chunks.Chunks)
+	//}
+}
+
+func (s *LeisureSession) ComputeInsertRepl(chunks *org.OrgChunks, blk map[string]any, out *bytes.Buffer) (repl doc.Replacement, prefixNL bool) {
+	prefixNl := false
+	name := blk["name"].(string)
+	//off, ch := s.Chunks.LocateChunkNamed(name)
+	off, ch := chunks.LocateChunkNamed(name)
+	if ch.IsEmpty() {
+		if blk["type"] == "delete" {
+			return doc.Replacement{}, false
+		}
+		// find a spot in the doc
+		//off = s.Chunks.Chunks.Measure().Width
+		off = chunks.Chunks.Measure().Width
+		//if !s.Chunks.Chunks.IsEmpty() {
+		if !chunks.Chunks.IsEmpty() {
+			//prefixNl = !strings.HasSuffix(s.Chunks.Chunks.PeekLast().AsOrgChunk().Text, "\n")
+			prefixNl = !strings.HasSuffix(chunks.Chunks.PeekLast().AsOrgChunk().Text, "\n")
+		}
+		//s.verbose("WIDTH: %d, LEN: %d", off, len(s.Chunks.GetText()))
+		s.verbose("WIDTH: %d, LEN: %d", off, len(chunks.GetText()))
+		if blk["type"] != "delete" && blk["tags"] != nil {
+		outer:
+			for tag := range u.PropStrings(blk["tags"]) {
+				// find headline with tag
+				//if t := s.Chunks.GetChunksTagged(tag); len(t) > 0 {
+				if t := chunks.GetChunksTagged(tag); len(t) > 0 {
+					for _, hl := range t {
+						//if nextId := s.Chunks.Next[hl.AsOrgChunk().Id]; nextId == "" {
+						if nextId := chunks.Next[hl.AsOrgChunk().Id]; nextId == "" {
+							continue
+							//} else if nextHl := s.Chunks.ChunkIds[nextId]; nextHl != nil {
+						} else if nextHl := chunks.ChunkIds[nextId]; nextHl != nil {
+							//off, _ = s.Chunks.LocateChunk(ch.AsOrgChunk().Id)
+							off, _ = chunks.LocateChunk(ch.AsOrgChunk().Id)
+							//if prevId := s.Chunks.Prev[nextId]; prevId != "" {
+							if prevId := chunks.Prev[nextId]; prevId != "" {
+								//prefixNl = !strings.HasSuffix(s.Chunks.ChunkIds[prevId].GetText(), "\n")
+								prefixNl = !strings.HasSuffix(chunks.ChunkIds[prevId].GetText(), "\n")
+							}
+							break outer
+						}
+					}
 				}
-				out.Reset()
 			}
-			changes = append(changes, change)
 		}
 	}
-	// reverse-sort indices by offset
-	slices.SortFunc(changes, func(a, b Change) int { return b.offset - a.offset })
-	// apply changes in reverse order
-	for i := len(changes); i > 0; {
-		i--
-		change := changes[i]
-		d.Apply("external", 0, []doc.Replacement{{
-			Offset: change.offset,
-			Length: org.Measure(change.chunk.Chunk).Width,
-			Text:   change.str,
-		}}[:])
+	change := doc.Replacement{Offset: off}
+	if !ch.IsEmpty() {
+		// this is not an insert, it's a replace or a delete
+		change.Length = org.Width(ch.Chunk)
 	}
-	//fmt.Println("APPLIED EXTERNAL CHANGES:\n", d.Changes("  "))
-	repls, _ := d.EditsFor(u.NewSet("external"), nil)
-	s.verbose("REPLACING: %#v\nINTO: %s", repls, org.Dump(s.Chunks))
-	// apply doc changes to org chunks
-	s.orgChanges(repls, chs, removed)
+	if blk["type"] != "delete" {
+		if prefixNl {
+			out.WriteRune('\n')
+		}
+		if err := s.ExternalFmt(out, blk); err != nil {
+			fmt.Fprint(os.Stderr, err)
+		} else {
+			change.Text = out.String()
+			fmt.Print("\n\nFORMATTED BLOCK: ", change.Text, "\n\n\n")
+		}
+		out.Reset()
+	}
+	return change, prefixNl
 }
 
 func (s *LeisureSession) SessionEdit(repl []doc.Replacement, selOffset, selLength int) (result map[string]any, err error) {
