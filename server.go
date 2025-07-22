@@ -148,7 +148,7 @@ type LeisureSession struct {
 	updateTimeout  time.Duration
 	ExclusiveDoc   *doc.Document // only set for an exclusive session -- it has no history
 	ExternalBlocks *u.ConcurrentQueue[map[string]any]
-	ExternalFmt    func(w io.Writer, m map[string]any) error
+	ExternalFmt    func(w io.Writer, m map[string]any, old org.ChunkRef) error
 	Listeners      []SessionListener
 }
 
@@ -1288,7 +1288,7 @@ func (s *LeisureSession) ComputeInsertRepl(chunks *org.OrgChunks, blk map[string
 		if prefixNl {
 			out.WriteRune('\n')
 		}
-		if err := s.ExternalFmt(out, blk); err != nil {
+		if err := s.ExternalFmt(out, blk, ch); err != nil {
 			fmt.Fprint(os.Stderr, err)
 		} else {
 			change.Text = out.String()
